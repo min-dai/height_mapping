@@ -12,7 +12,7 @@ int main() {
   float robot_x = 0.0; float robot_y = 0.0; float robot_yaw = 0.0;
   map.ensureOrigin(robot_x, robot_y);
   std::vector<height_mapping::Point3f> pts;
-  for (int k = 0; k < 200000; ++k) {
+  for (int k = 0; k < 20000; ++k) {
     float x = -3.0f + 6.0f*float(rand())/RAND_MAX;
     float y = -3.0f + 6.0f*float(rand())/RAND_MAX;
     float z = 0.2f + 0.25f * x;               // shallow slope

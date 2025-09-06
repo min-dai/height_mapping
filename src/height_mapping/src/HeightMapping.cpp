@@ -2,6 +2,22 @@
 #include <iostream>
 #include <algorithm>
 
+#ifdef HEIGHT_MAPPING_PROFILE
+#include <chrono>
+#define PROFILE_START(name) auto start_##name = std::chrono::high_resolution_clock::now()
+#define PROFILE_END(name) \
+  do { \
+    auto end_##name = std::chrono::high_resolution_clock::now(); \
+    auto dur_##name = std::chrono::duration_cast<std::chrono::microseconds>(end_##name - start_##name); \
+    std::cout << "[PROFILE] " << #name << ": " << dur_##name.count() << " μs\n"; \
+  } while(0)
+#define PROFILE_SAVE_PNG(mat, path) save_png(mat, path)
+#else
+#define PROFILE_START(name) do {} while(0)
+#define PROFILE_END(name) do {} while(0)
+#define PROFILE_SAVE_PNG(mat, path) do {} while(0)
+#endif
+
 namespace height_mapping {
 
 void save_png(const cv::Mat& m, const std::string& path) {
@@ -234,7 +250,10 @@ inline void HeightMap::zaggInsert_(ZAgg& agg, float z) {
 
 void HeightMap::solveGlobalFill_()
 {
+  PROFILE_START(total_solve);
+  
   // ---------- Snapshot under one short lock ----------
+  PROFILE_START(copy_from_ringbuffer);
   cv::Mat big_height(Hb_, Wb_, CV_32FC1);
   cv::Mat big_boundary_conn(Hb_, Wb_, CV_32FC1); // delta-connected max
   cv::Mat big_occluded(Hb_, Wb_, CV_8UC1);       // 1=occluded, 0=observed
@@ -255,15 +274,18 @@ void HeightMap::solveGlobalFill_()
       }
     }
   }
+  PROFILE_END(copy_from_ringbuffer);
 
-  save_png(big_height, "big_height0.png");
-  save_png(big_boundary_conn, "big_boundary_conn0.png");
-  save_png(big_occluded, "big_occluded0.png");
+  PROFILE_SAVE_PNG(big_height, "big_height0.png");
+  PROFILE_SAVE_PNG(big_boundary_conn, "big_boundary_conn0.png");
+  PROFILE_SAVE_PNG(big_occluded, "big_occluded0.png");
 
   // ---------- Build occlusion mask & edge clusters ----------
+  PROFILE_START(connected_components);
   cv::Mat occ_mask = (big_occluded > 0); // CV_8U, 0/255 interior=in mask  TODO: why not just use big_occluded directly?
   cv::Mat occluded_labels;
   const int n_labels = cv::connectedComponents(occ_mask, occluded_labels, 4, CV_32S);
+  PROFILE_END(connected_components);
   std::vector<uint8_t> cluster_touches_edge(std::max(1, n_labels), 0);
 
   auto mark_if_edge = [&](int i, int j) {
@@ -276,8 +298,9 @@ void HeightMap::solveGlobalFill_()
   for (int i = 0; i < Hb_; ++i) { mark_if_edge(i, 0); mark_if_edge(i, Wb_-1); }
 
   // Any occluded cell whose component touches the outer border: set to max and remove from mask
+  PROFILE_START(set_boundary_occlusions);
   // TODO: do we need the additional clones? we have already coppied height_b
-  cv::Mat working_mask = occ_mask.clone(); // we’ll edit this
+  cv::Mat working_mask = occ_mask.clone(); // we'll edit this
   cv::Mat changed_working_mask(working_mask.rows, working_mask.cols, CV_8UC1, cv::Scalar(0));       // 1=occluded, 0=observed
   cv::Mat solver_field = big_height.clone(); // used by the PDE
   for (int i = 0; i < Hb_; ++i) {
@@ -288,14 +311,16 @@ void HeightMap::solveGlobalFill_()
       const int lbl = occluded_labels.at<int>(i,j);
       if (cluster_touches_edge[lbl]) {
         solver_field_row[j] = static_cast<float>(max_h_);
-        working_mask_row[j] = 0; // don’t solve there TOOO: we can just use occ_mask here?
+        working_mask_row[j] = 0; // don't solve there TOOO: we can just use occ_mask here?
       }
     }
   }
-  save_png(working_mask * 255, "working_mask0.png");
-  save_png(solver_field, "solver_field0.png");
+  PROFILE_END(set_boundary_occlusions);
+  PROFILE_SAVE_PNG(working_mask * 255, "working_mask0.png");
+  PROFILE_SAVE_PNG(solver_field, "solver_field0.png");
 
   // ---------- Dirichlet boundary only for the PDE (do NOT persist into output) ----------
+  PROFILE_START(update_boundary_conditions);
   // Boundary = observed cells that are 4-neighbors of currently occluded cells
   for (int i = 0; i < Hb_; ++i) {
     uint8_t* mrow = working_mask.ptr<uint8_t>(i);
@@ -334,14 +359,16 @@ void HeightMap::solveGlobalFill_()
       // else: keep raw height as boundary
     }
   }
+  PROFILE_END(update_boundary_conditions);
 
-  save_png(big_boundary_conn, "big_boundary_conn.png");
+  PROFILE_SAVE_PNG(big_boundary_conn, "big_boundary_conn.png");
   working_mask &= changed_working_mask == 0; // add these new boundary pixels to the PDE mask
-  save_png(changed_working_mask * 255, "changed_working_mask.png");
-  save_png(working_mask * 255, "working_mask1.png");
-  save_png(solver_field, "solver_field1.png");
+  PROFILE_SAVE_PNG(changed_working_mask * 255, "changed_working_mask.png");
+  PROFILE_SAVE_PNG(working_mask * 255, "working_mask1.png");
+  PROFILE_SAVE_PNG(solver_field, "solver_field1.png");
 
   // ---------- Warm start & clamp ----------
+  PROFILE_START(laplace_solve);
   // If we have a previous full-grid solution matching the current size, warm-start the interior
   if (!prev_fill_full_.empty() &&
       prev_fill_full_.rows == Hb_ && prev_fill_full_.cols == Wb_) {
@@ -359,6 +386,7 @@ void HeightMap::solveGlobalFill_()
     const float hi = std::isfinite(max_b) ? static_cast<float>(max_b) : static_cast<float>(max_h_);
     harmonicFillROI_(solver_field, working_mask, lo, hi, /*iters=*/80, /*eps=*/1e-3f, /*init_interior=*/true);
   }
+  PROFILE_END(laplace_solve);
 
   // ---------- Build final field: keep observed cells as raw heights ----------
   //  TODO: is this copying necessary
@@ -367,16 +395,19 @@ void HeightMap::solveGlobalFill_()
   solver_field.copyTo(final_field, working_mask);     // only interior pixels get the PDE result
   prev_fill_full_ = final_field;                      // cache for warm start next time
 
-  save_png(final_field, "final_field.png");
-  save_png(working_mask * 255, "working_mask2.png");
-  save_png(solver_field, "solver_field2.png");
+  PROFILE_SAVE_PNG(final_field, "final_field.png");
+  PROFILE_SAVE_PNG(working_mask * 255, "working_mask2.png");
+  PROFILE_SAVE_PNG(solver_field, "solver_field2.png");
 
-  // ---------- Write back if the grid didn’t shift while we solved ----------
+  // ---------- Write back if the grid didn't shift while we solved ----------
+  PROFILE_START(copy_to_ringbuffer);
   {
     std::lock_guard<std::mutex> lk(m_);
     if (version_snapshot != rb_version_) {
       // Grid moved (recenter/shift) during solve; discard this stale result.
       // TODO: maybe just move/shift this result instead of doing nothing?
+      PROFILE_END(copy_to_ringbuffer);
+      PROFILE_END(total_solve);
       return;
     }
 
@@ -389,8 +420,10 @@ void HeightMap::solveGlobalFill_()
       }
     }
   }
+  PROFILE_END(copy_to_ringbuffer);
 
   have_prev_fill_ = true;
+  PROFILE_END(total_solve);
 }
 
 void HeightMap::ingestPoints(const std::vector<Point3f>& pts) {
@@ -544,47 +577,6 @@ void HeightMap::sampleBilinearBoth_(double wx, double wy,
 }
 
 // (Kept for parity; no longer used when solving globally before sampling)
-void HeightMap::brushfireFill_(const cv::Mat& sub_raw,
-                               const cv::Mat& sub_bound,
-                               const cv::Mat& sub_occ,
-                               const cv::Mat& sub_edge,
-                               cv::Mat& sub_filled) const {
-  CV_Assert(sub_raw.type()   == CV_32FC1);
-  CV_Assert(sub_bound.type() == CV_32FC1);
-  CV_Assert(sub_occ.type()   == CV_8UC1);
-  CV_Assert(sub_edge.type()  == CV_8UC1);
-
-  // Start from sub_raw
-  sub_filled = sub_raw.clone();
-
-  // Mask of all occluded cells
-  cv::Mat mask = (sub_occ > 0);
-
-  // Edge-touching occlusions: force to max and remove from mask
-  for (int i = 0; i < sub_edge.rows; ++i) {
-    const uint8_t* e = sub_edge.ptr<uint8_t>(i);
-    const uint8_t* m = mask.ptr<uint8_t>(i);
-    float* f         = sub_filled.ptr<float>(i);
-    for (int j = 0; j < sub_edge.cols; ++j) {
-      if (m[j] && e[j]) {
-        f[j] = static_cast<float>(max_h_);
-        mask.at<uint8_t>(i,j) = 0;
-      }
-    }
-  }
-
-  // Dirichlet boundary = boundary-connected heights on observed cells
-  sub_bound.copyTo(sub_filled, ~mask);
-
-  // Clamp range from boundary
-  double minb, maxb;
-  cv::minMaxLoc(sub_bound, &minb, &maxb, nullptr, nullptr, ~mask);
-  const float lo = std::isfinite(minb) ? static_cast<float>(minb) : 0.0f;
-  const float hi = std::isfinite(maxb) ? static_cast<float>(maxb) : static_cast<float>(max_h_);
-
-  // Solve Laplace in occluded mask
-  harmonicFillROI_(sub_filled, mask, lo, hi, /*iters=*/80, /*eps=*/1e-3f);
-}
 
 void HeightMap::generateSubgrid(double rx, double ry, double rYaw,
                                 cv::Mat& sub_raw, cv::Mat& sub_filled, SubgridMeta& meta) const

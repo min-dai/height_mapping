@@ -71,12 +71,6 @@ private:
                            float& h_raw, float& h_bound,
                            uint8_t& occ_val, uint8_t& edge_touch) const;
 
-  // Brushfire now uses sub_bound for boundary minima
-  void brushfireFill_(const cv::Mat& sub_raw,
-                      const cv::Mat& sub_bound,
-                      const cv::Mat& sub_occ,
-                      const cv::Mat& sub_edge,
-                      cv::Mat& sub_filled) const;
 
   // --- NEW: per-cell z-histogram aggregator ---
   struct ZAgg {

@@ -2,7 +2,7 @@
 <package format="3">
   <name>height_mapping</name>
   <version>0.2.0</version>
-  <description>Axis-aligned big grid + robot-aligned subgrid with occlusion brushfire fill</description>
+  <description>Axis-aligned big grid + robot-aligned subgrid with occlusion harmonic fill</description>
   <maintainer email="wcompton@caltech.edu">you</maintainer>
   <license>BSD-3-Clause</license>
 
@@ -20,5 +20,7 @@
   <build_export_depend>libopencv-dev</build_export_depend>
   <exec_depend>libopencv-dev</exec_depend>
 
-  <export/>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
 </package>

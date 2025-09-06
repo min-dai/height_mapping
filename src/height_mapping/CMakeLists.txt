@@ -4,6 +4,12 @@ project(height_mapping)
 set(CMAKE_CXX_STANDARD 17)
 add_compile_options(-O3 -march=native -mtune=native)
 
+# Profiling option
+option(ENABLE_PROFILING "Enable profiling and debug outputs" OFF)
+if(ENABLE_PROFILING)
+  add_compile_definitions(HEIGHT_MAPPING_PROFILE)
+endif()
+
 find_package(ament_cmake REQUIRED)
 find_package(OpenCV REQUIRED)
 
@@ -45,6 +51,7 @@ endif()
 install(TARGETS height_mapping_core DESTINATION lib)
 install(TARGETS height_mapping_node DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY include/ DESTINATION include)
+install(DIRECTORY launch/ DESTINATION share/${PROJECT_NAME}/launch)
 
 ament_package()
 

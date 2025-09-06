@@ -4,6 +4,7 @@ install/
 log/
 .colcon/
 **/COLCON_IGNORE
+bags/
 
 # Python / C++
 __pycache__/

@@ -21,15 +21,15 @@
 
 class HeightMapNode : public rclcpp::Node {
 public:
-  HeightMapNode() : Node("largegrid_elevation_map_node"),
+  HeightMapNode() : Node("height_mapping_node"),
               tf_buffer_(this->get_clock()), tf_listener_(tf_buffer_) {
 
     // --- params ---
     height_mapping::Params P;
-    map_frame_    = declare_parameter<std::string>("map_frame", "map");
-    base_frame_   = declare_parameter<std::string>("base_frame", "base_link");
+    map_frame_    = declare_parameter<std::string>("map_frame", "camera_init");
+    base_frame_   = declare_parameter<std::string>("base_frame", "body");
     topic_cloud_  = declare_parameter<std::string>("topic_cloud", "/cloud_registered");
-    lidar_frame_  = declare_parameter<std::string>("lidar_frame", "");
+    lidar_frame_  = declare_parameter<std::string>("livox_frame", "");
 
     P.res         = declare_parameter<double>("resolution", 0.05);
     P.Wb          = declare_parameter<int>("big_width", 400);
@@ -67,28 +67,62 @@ public:
         std::chrono::duration_cast<std::chrono::milliseconds>(period),
         std::bind(&HeightMapNode::onPublish, this));
 
-    RCLCPP_INFO(get_logger(), "hieght_mapping node up: big %dx%d @%.2f, sub %dx%d @%.2f",
+    RCLCPP_INFO(get_logger(), "height_mapping node up: big %dx%d @%.2f, sub %dx%d @%.2f",
                 P.Wb, P.Hb, P.res, P.Wq, P.Hq, P.res_q);
+    RCLCPP_INFO(get_logger(), "Constructor completed successfully");
+    RCLCPP_INFO(get_logger(), "Waiting for transforms: %s -> %s", map_frame_.c_str(), base_frame_.c_str());
+    RCLCPP_INFO(get_logger(), "Subscribed to point cloud topic: %s", topic_cloud_.c_str());
   }
 
 private:
   bool getRobotPose(const rclcpp::Time& t, double& x, double& y, double& yaw) {
     try {
-      auto T = tf_buffer_.lookupTransform(map_frame_, base_frame_, t, tf2::durationFromSec(0.05));
+      RCLCPP_DEBUG(get_logger(), "Attempting TF lookup: %s -> %s", map_frame_.c_str(), base_frame_.c_str());
+      // Try with exact timestamp first
+      auto T = tf_buffer_.lookupTransform(map_frame_, base_frame_, t, tf2::durationFromSec(0.2));
       x = T.transform.translation.x;
       y = T.transform.translation.y;
       const auto &q = T.transform.rotation;
       tf2::Quaternion qq(q.x, q.y, q.z, q.w);
       tf2::Matrix3x3 R(qq);
       double roll, pitch; R.getRPY(roll, pitch, yaw);
+      RCLCPP_DEBUG(get_logger(), "TF lookup success: pose (%.2f, %.2f, %.2f)", x, y, yaw);
       return true;
-    } catch (...) { return false; }
+    } catch (const tf2::ExtrapolationException& e) {
+      // If extrapolation fails, try with latest available transform
+      try {
+        RCLCPP_DEBUG(get_logger(), "Extrapolation failed, trying latest transform");
+        auto T = tf_buffer_.lookupTransform(map_frame_, base_frame_, tf2::TimePointZero);
+        x = T.transform.translation.x;
+        y = T.transform.translation.y;
+        const auto &q = T.transform.rotation;
+        tf2::Quaternion qq(q.x, q.y, q.z, q.w);
+        tf2::Matrix3x3 R(qq);
+        double roll, pitch; R.getRPY(roll, pitch, yaw);
+        RCLCPP_DEBUG(get_logger(), "TF lookup success with latest: pose (%.2f, %.2f, %.2f)", x, y, yaw);
+        return true;
+      } catch (const std::exception& e2) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "TF lookup failed (latest): %s", e2.what());
+        return false;
+      }
+    } catch (const std::exception& e) { 
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "TF lookup failed: %s", e.what());
+      return false; 
+    }
   }
 
   void cloudCb(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000, "Received point cloud with %d points", 
+                         msg->width * msg->height);
+    
     // TF: ensure origin & recenter
     double rx, ry, rYaw;
-    if (!getRobotPose(msg->header.stamp, rx, ry, rYaw)) return;
+    if (!getRobotPose(msg->header.stamp, rx, ry, rYaw)) {
+      RCLCPP_DEBUG(get_logger(), "Skipping cloud processing - no robot pose");
+      return;
+    }
+    RCLCPP_DEBUG(get_logger(), "Processing cloud at robot pose (%.2f, %.2f, %.2f)", rx, ry, rYaw);
+    
     mapper_->ensureOrigin(rx, ry);
     mapper_->recenterIfNeeded(rx, ry);
 
@@ -108,7 +142,6 @@ private:
         vg.setLeafSize(voxel_leaf_, voxel_leaf_, voxel_leaf_);
         vg.filter(pcl_out);
 
-        sensor_msgs::msg::PointCloud2 cloud_ds;
         pcl_conversions::fromPCL(pcl_out, cloud_ds);
         cloud_in = &cloud_ds;
     }
@@ -120,7 +153,7 @@ private:
       const std::string src_frame = cloud_in->header.frame_id.empty() ? lidar_frame_ : cloud_in->header.frame_id;
       if (!src_frame.empty() && src_frame != map_frame_) {
         try {
-          T_map_src = tf_buffer_.lookupTransform(map_frame_, src_frame, msg->header.stamp, tf2::durationFromSec(0.05));
+          T_map_src = tf_buffer_.lookupTransform(map_frame_, src_frame, msg->header.stamp, tf2::durationFromSec(0.1));
           do_tf = true;
         } catch (...) {
           RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "TF missing %s->%s", map_frame_.c_str(), src_frame.c_str());
@@ -160,18 +193,30 @@ private:
       pts.push_back(height_mapping::Point3f{static_cast<float>(x), static_cast<float>(y), static_cast<float>(z)});
     }
 
+    RCLCPP_DEBUG(get_logger(), "Ingesting %zu points into height map", pts.size());
     mapper_->ingestPoints(pts);
+    RCLCPP_DEBUG(get_logger(), "Point ingestion completed");
   }
 
   void onPublish() {
+    RCLCPP_DEBUG(get_logger(), "Publish timer callback triggered");
+    
     // Pose at publish time
     double rx, ry, rYaw;
-    if (!getRobotPose(now(), rx, ry, rYaw)) return;
-    if (!mapper_->haveOrigin()) return;
+    if (!getRobotPose(now(), rx, ry, rYaw)) {
+      RCLCPP_DEBUG(get_logger(), "Skipping publish - no robot pose");
+      return;
+    }
+    if (!mapper_->haveOrigin()) {
+      RCLCPP_DEBUG(get_logger(), "Skipping publish - no map origin set");
+      return;
+    }
 
+    RCLCPP_DEBUG(get_logger(), "Generating subgrid at pose (%.2f, %.2f, %.2f)", rx, ry, rYaw);
     cv::Mat sub_raw, sub_filled;
     height_mapping::SubgridMeta meta;
     mapper_->generateSubgrid(rx, ry, rYaw, sub_raw, sub_filled, meta);
+    RCLCPP_DEBUG(get_logger(), "Subgrid generated: %dx%d", meta.width, meta.height);
 
     // Publish images
     auto stamp = now();
@@ -202,6 +247,7 @@ private:
     mm.origin.orientation.w = cy;
 
     pub_meta_->publish(mm);
+    RCLCPP_DEBUG(get_logger(), "Published height maps and metadata");
   }
 
 private:

@@ -102,23 +102,29 @@ HeightMap::HeightMap(const Params& p)
 
   // Derive histogram config
   bin_size_       = params_.z_hist_bin;
-  B_              = std::max(1, static_cast<int>(std::ceil((zmax_ - zmin_) / bin_size_)));
+  z_shift_thresh_ = params_.z_shift_thresh;
+  // Create enough bins to cover a reasonable height range around robot
+  const double hist_range = 2.0; // ±1m around robot
+  B_              = std::max(1, static_cast<int>(std::ceil(hist_range / bin_size_)));
   max_empty_bins_ = std::max(0, static_cast<int>(std::floor(params_.z_connect_delta / bin_size_)) - 1);
   bin_min_count_  = std::max(1, params_.z_bin_min_count);
+  hist_z_center_  = 0.0; // will be set in ensureOrigin
+  hist_z_min_     = 0.0;
+  hist_z_max_     = 0.0;
 
   reset();
 }
 
 void HeightMap::reset() {
   const size_t Nb = static_cast<size_t>(Wb_) * static_cast<size_t>(Hb_);
-  height_b_.assign(Nb, static_cast<float>(max_h_));
+  height_b_.assign(Nb, static_cast<float>(max_h_ + robot_z_));
   known_b_.assign(Nb, 0);
   occ_b_.assign(Nb, 1);
   stamp_b_.assign(Nb, 0.0f);
 
   // Per-cell z histograms and delta-connected max height
   zagg_b_.resize(Nb);
-  hconn_b_.assign(Nb, static_cast<float>(max_h_));
+  hconn_b_.assign(Nb, static_cast<float>(max_h_ + robot_z_));
   for (size_t i = 0; i < Nb; ++i) zaggInit_(zagg_b_[i]);
 
   temp_min_.assign(Nb, std::numeric_limits<float>::infinity());
@@ -133,10 +139,18 @@ void HeightMap::reset() {
   have_prev_fill_ = false;
 }
 
-void HeightMap::ensureOrigin(double robot_x, double robot_y) {
+void HeightMap::ensureOrigin(double robot_x, double robot_y, double robot_z) {
   if (have_origin_) return;
   origin_x_ = robot_x - 0.5 * Wb_ * res_;
   origin_y_ = robot_y - 0.5 * Hb_ * res_;
+  robot_z_ = robot_z;
+  
+  // Initialize histogram bounds around robot z position
+  const double hist_range = B_ * bin_size_;
+  hist_z_center_ = robot_z;
+  hist_z_min_    = robot_z - hist_range / 2.0;
+  hist_z_max_    = robot_z + hist_range / 2.0;
+  
   have_origin_ = true;
 }
 
@@ -146,24 +160,24 @@ void HeightMap::shiftRingBuffer_(int si, int sj) {
   auto wipe_col = [&](int col) {
     for (int row = 0; row < Hb_; ++row) {
       size_t id = static_cast<size_t>(row) * Wb_ + static_cast<size_t>(col);
-      height_b_[id] = static_cast<float>(max_h_);
+      height_b_[id] = static_cast<float>(max_h_ + robot_z_);
       known_b_[id]  = 0;
       occ_b_[id]    = 1;
       stamp_b_[id]  = 0.0f;
       zaggInit_(zagg_b_[id]);
-      hconn_b_[id]  = static_cast<float>(max_h_);
+      hconn_b_[id]  = static_cast<float>(max_h_ + robot_z_);
     }
   };
   auto wipe_row = [&](int row) {
     size_t row_off = static_cast<size_t>(row) * Wb_;
     for (int col = 0; col < Wb_; ++col) {
       size_t id = row_off + static_cast<size_t>(col);
-      height_b_[id] = static_cast<float>(max_h_);
+      height_b_[id] = static_cast<float>(max_h_ + robot_z_);
       known_b_[id]  = 0;
       occ_b_[id]    = 1;
       stamp_b_[id]  = 0.0f;
       zaggInit_(zagg_b_[id]);
-      hconn_b_[id]  = static_cast<float>(max_h_);
+      hconn_b_[id]  = static_cast<float>(max_h_ + robot_z_);
     }
   };
 
@@ -188,32 +202,46 @@ void HeightMap::shiftRingBuffer_(int si, int sj) {
   ++rb_version_;
 }
 
-void HeightMap::recenterIfNeeded(double robot_x, double robot_y) {
+void HeightMap::recenterIfNeeded(double robot_x, double robot_y, double robot_z) {
   if (!have_origin_) return;
+  
+  // Check x,y recentering
   const double cx = origin_x_ + 0.5 * Wb_ * res_;
   const double cy = origin_y_ + 0.5 * Hb_ * res_;
   const double dx = robot_x - cx;
   const double dy = robot_y - cy;
-  if (std::abs(dx) < shift_thresh_ && std::abs(dy) < shift_thresh_) return;
-
-  const int sj = static_cast<int>(std::floor(dx / res_));
-  const int si = static_cast<int>(std::floor(dy / res_));
-  if (si == 0 && sj == 0) return;
-
-  origin_x_ += sj * res_;
-  origin_y_ += si * res_;
-  shiftRingBuffer_(si, sj);
+  bool need_xy_shift = (std::abs(dx) >= shift_thresh_ || std::abs(dy) >= shift_thresh_);
+  
+  // Check z recentering
+  const double dz = robot_z - hist_z_center_;
+  bool need_z_shift = (std::abs(dz) >= z_shift_thresh_);
+  
+  robot_z_ = robot_z;
+  
+  if (need_z_shift) {
+    recenterHistogramBounds_(robot_z);
+  }
+  
+  if (need_xy_shift) {
+    const int sj = static_cast<int>(std::floor(dx / res_));
+    const int si = static_cast<int>(std::floor(dy / res_));
+    if (si != 0 || sj != 0) {
+      origin_x_ += sj * res_;
+      origin_y_ += si * res_;
+      shiftRingBuffer_(si, sj);
+    }
+  }
 }
 
 // --- per-cell histogram update ---
 inline void HeightMap::zaggInsert_(ZAgg& agg, float z) {
-  int bin = static_cast<int>(std::floor((z - static_cast<float>(zmin_)) / static_cast<float>(bin_size_)));
-  if (bin < 0 || bin >= B_) return;   // z is outside histogram range
+  // Map z to bin index using current histogram bounds
+  int bin = static_cast<int>(std::floor((z - hist_z_min_) / bin_size_));
+  if (bin < 0 || bin >= B_) return;   // z is outside current histogram range
 
   uint8_t& count = agg.bins[bin];     // Increment the appropriate count, if bin not saturated
   if (count < 255) ++count;
-  // if (count < bin_min_count_) return; // Not enough points yet in this bin, not considered full yet.
-
+  
   auto bin_present = [&](int idx)->bool {
     return (idx >= 0 && idx < B_) && (agg.bins[idx] >= bin_min_count_);
   };  // Check if a bin is occupied, i.e. has more than bin_min_count_ points
@@ -225,10 +253,7 @@ inline void HeightMap::zaggInsert_(ZAgg& agg, float z) {
       if (bin_present(t)) { top = t; gaps = 0; }
       else if (++gaps > max_empty_bins_) break;
     }
-    agg.top_conn_from_min = top;  // This updates to the index which is the top connected from the minimum bin
-    //TODO: can this be more efficient? We are doing a linear scan from min_bin every time we insert a new min_bin
-    // it might be possible - if the new bin is the minimum, we only need to scan up to the previous min_bin. If this scan is connected, 
-    // top is unchanged. Otherwise, top is in (min_bin, previous_min_bin - max_empty_bins_])
+    agg.top_conn_from_min = top;
   } else if (agg.top_conn_from_min >= 0 && bin <= agg.top_conn_from_min + max_empty_bins_) {
     int top = agg.top_conn_from_min, gaps = 0;
     for (int t = top + 1; t < B_; ++t) {
@@ -236,15 +261,83 @@ inline void HeightMap::zaggInsert_(ZAgg& agg, float z) {
       else if (++gaps > max_empty_bins_) break;
     }
     agg.top_conn_from_min = top;
-    // Here we do have to scan all the way up, since the point could have plugged a hole. 
   }
 
+  // Update cached heights using current histogram bounds
   if (agg.min_bin < B_) {
-    agg.h_min = static_cast<float>(zmin_ + (agg.min_bin + 0.5) * bin_size_);
+    agg.h_min = static_cast<float>(hist_z_min_ + (agg.min_bin + 0.5) * bin_size_);
     int top = (agg.top_conn_from_min >= 0) ? agg.top_conn_from_min : agg.min_bin;
-    agg.h_conn_max = static_cast<float>(zmin_ + (top + 0.5) * bin_size_);
+    agg.h_conn_max = static_cast<float>(hist_z_min_ + (top + 0.5) * bin_size_);
   } else {
-    agg.h_min = agg.h_conn_max = static_cast<float>(max_h_);
+    agg.h_min = agg.h_conn_max = static_cast<float>(max_h_ + robot_z_);
+  }
+}
+
+void HeightMap::recenterHistogramBounds_(double new_robot_z) {
+  const double old_center = hist_z_center_;
+  const double old_min = hist_z_min_;
+  
+  // Update histogram bounds to be centered around new robot z
+  const double hist_range = B_ * bin_size_;
+  hist_z_center_ = new_robot_z;
+  hist_z_min_ = new_robot_z - hist_range / 2.0;
+  hist_z_max_ = new_robot_z + hist_range / 2.0;
+  
+  // Calculate how many bins we need to shift
+  const double z_shift = new_robot_z - old_center;
+  const int shift_bins = static_cast<int>(std::round(z_shift / bin_size_));
+  
+  if (shift_bins == 0) return; // No shifting needed
+  
+  // Cycle all histogram bins
+  std::lock_guard<std::mutex> lk(m_);
+  const size_t N = static_cast<size_t>(Wb_) * static_cast<size_t>(Hb_);
+  for (size_t i = 0; i < N; ++i) {
+    cycleBins_(zagg_b_[i], shift_bins);
+  }
+}
+
+void HeightMap::cycleBins_(ZAgg& agg, int shift_bins) {
+  if (shift_bins == 0 || agg.bins.empty()) return;
+  
+  const int B = static_cast<int>(agg.bins.size());
+  std::vector<uint8_t> new_bins(B, 0);
+  
+  // Copy bins to new positions, wrapping around
+  for (int old_idx = 0; old_idx < B; ++old_idx) {
+    if (agg.bins[old_idx] > 0) {
+      int new_idx = old_idx - shift_bins;
+      // Clamp to valid range instead of wrapping
+      if (new_idx >= 0 && new_idx < B) {
+        new_bins[new_idx] = agg.bins[old_idx];
+      }
+    }
+  }
+  
+  agg.bins = std::move(new_bins);
+  
+  // Update bin indices
+  if (agg.min_bin < B) {
+    agg.min_bin -= shift_bins;
+    if (agg.min_bin < 0 || agg.min_bin >= B) {
+      agg.min_bin = B; // Mark as invalid
+    }
+  }
+  
+  if (agg.top_conn_from_min >= 0) {
+    agg.top_conn_from_min -= shift_bins;
+    if (agg.top_conn_from_min < 0 || agg.top_conn_from_min >= B) {
+      agg.top_conn_from_min = -1; // Mark as invalid
+    }
+  }
+  
+  // Recalculate heights with new bounds
+  if (agg.min_bin < B) {
+    agg.h_min = static_cast<float>(hist_z_min_ + (agg.min_bin + 0.5) * bin_size_);
+    int top = (agg.top_conn_from_min >= 0) ? agg.top_conn_from_min : agg.min_bin;
+    agg.h_conn_max = static_cast<float>(hist_z_min_ + (top + 0.5) * bin_size_);
+  } else {
+    agg.h_min = agg.h_conn_max = static_cast<float>(max_h_ + robot_z_);
   }
 }
 
@@ -310,7 +403,7 @@ void HeightMap::solveGlobalFill_()
       if (!working_mask_row[j]) continue;
       const int lbl = occluded_labels.at<int>(i,j);
       if (cluster_touches_edge[lbl]) {
-        solver_field_row[j] = static_cast<float>(max_h_);
+        solver_field_row[j] = static_cast<float>(max_h_ + robot_z_);
         working_mask_row[j] = 0; // don't solve there TOOO: we can just use occ_mask here?
       }
     }
@@ -383,7 +476,7 @@ void HeightMap::solveGlobalFill_()
     double min_b = 0.0, max_b = 0.0;
     cv::minMaxLoc(solver_field, &min_b, &max_b, nullptr, nullptr, invMask);
     const float lo = std::isfinite(min_b) ? static_cast<float>(min_b) : 0.0f;
-    const float hi = std::isfinite(max_b) ? static_cast<float>(max_b) : static_cast<float>(max_h_);
+    const float hi = std::isfinite(max_b) ? static_cast<float>(max_b) : static_cast<float>(max_h_ + robot_z_);
     harmonicFillROI_(solver_field, working_mask, lo, hi, /*iters=*/80, /*eps=*/1e-3f, /*init_interior=*/true);
   }
   PROFILE_END(laplace_solve);
@@ -412,7 +505,7 @@ void HeightMap::solveGlobalFill_()
     }
 
     const size_t N = static_cast<size_t>(Hb_) * static_cast<size_t>(Wb_);
-    if (filled_b_.size() != N) filled_b_.assign(N, static_cast<float>(max_h_));
+    if (filled_b_.size() != N) filled_b_.assign(N, static_cast<float>(max_h_ + robot_z_));
     for (int i = 0; i < Hb_; ++i) {
       const float* row = final_field.ptr<float>(i);
       for (int j = 0; j < Wb_; ++j) {
@@ -492,7 +585,7 @@ inline void HeightMap::sampleFilled_(double wx, double wy, float& h_fill) const
   const double dv = vf - i0;
 
   if (i0 < 0 || i0 + 1 >= Hb_ || j0 < 0 || j0 + 1 >= Wb_) {
-    h_fill = static_cast<float>(max_h_);
+    h_fill = static_cast<float>(max_h_ + robot_z_);
     return;
   }
 
@@ -526,8 +619,8 @@ void HeightMap::sampleBilinearBoth_(double wx, double wy,
   const double dv = vf - i0;
 
   if (i0 < 0 || i0 + 1 >= Hb_ || j0 < 0 || j0 + 1 >= Wb_) {
-    h_raw = static_cast<float>(max_h_);
-    h_bound = static_cast<float>(max_h_);
+    h_raw = static_cast<float>(max_h_ + robot_z_);
+    h_bound = static_cast<float>(max_h_ + robot_z_);
     occ_val = 1;
     edge_touch = 1;
     return;
@@ -569,8 +662,8 @@ void HeightMap::sampleBilinearBoth_(double wx, double wy,
     h_bound = static_cast<float>(b_interp);
     occ_val = 0;
   } else {
-    h_raw   = static_cast<float>(max_h_);
-    h_bound = static_cast<float>(max_h_);
+    h_raw   = static_cast<float>(max_h_ + robot_z_);
+    h_bound = static_cast<float>(max_h_ + robot_z_);
     occ_val = 1;
   }
   edge_touch = 0;
@@ -585,7 +678,7 @@ void HeightMap::generateSubgrid(double rx, double ry, double rYaw,
   const int Wb = Wb_, Hb = Hb_;
   double origin_x, origin_y, res;
   int start_i, start_j;
-  double max_h = max_h_;
+  double max_h = max_h_ + robot_z_;
 
   // Local copies of ring-buffered arrays (flat, row-major)
   std::vector<float> snap_height;

@@ -37,6 +37,7 @@ struct Params {
   double z_hist_bin = 0.02;      // bin size [m], choose <= δ/2
   double z_connect_delta = 0.05; // δ: tolerate gaps up to this [m]
   int    z_bin_min_count = 2;    // min bin occupancy to count as "present"
+  double z_shift_thresh = 0.1;   // min z movement before recentering bins [m]
 };
 
 void save_png(const cv::Mat& m, const std::string& path);
@@ -46,8 +47,8 @@ public:
   explicit HeightMap(const Params& p);
   void reset();
 
-  void ensureOrigin(double robot_x, double robot_y);
-  void recenterIfNeeded(double robot_x, double robot_y);
+  void ensureOrigin(double robot_x, double robot_y, double robot_z);
+  void recenterIfNeeded(double robot_x, double robot_y, double robot_z);
 
   void ingestPoints(const std::vector<Point3f>& pts);
 
@@ -72,13 +73,13 @@ private:
                            uint8_t& occ_val, uint8_t& edge_touch) const;
 
 
-  // --- NEW: per-cell z-histogram aggregator ---
+  // --- NEW: per-cell z-histogram aggregator (robot-relative) ---
   struct ZAgg {
     std::vector<uint8_t> bins; // size B_
     int min_bin;               // lowest non-empty bin index (or B_ if none)
     int top_conn_from_min;     // highest δ-connected bin from min_bin
-    float h_min;               // cached meters
-    float h_conn_max;          // cached meters (to sample into sub_bound)
+    float h_min;               // cached meters (absolute world coords)
+    float h_conn_max;          // cached meters (absolute world coords)
     ZAgg() : min_bin(0), top_conn_from_min(-1), h_min(0), h_conn_max(0) {}
   };
 
@@ -86,11 +87,13 @@ private:
     a.bins.assign(B_, 0u);
     a.min_bin = B_;
     a.top_conn_from_min = -1;
-    a.h_min = static_cast<float>(max_h_);
-    a.h_conn_max = static_cast<float>(max_h_);
+    a.h_min = static_cast<float>(robot_z_ + max_h_);
+    a.h_conn_max = static_cast<float>(robot_z_ + max_h_);
   }
 
   inline void zaggInsert_(ZAgg& a, float z); // update bins & caches
+  void recenterHistogramBounds_(double new_robot_z); // recenter z bins if needed
+  void cycleBins_(ZAgg& agg, int shift_bins); // cycle bins up/down by shift_bins
 
 private:
   // Params & sizes
@@ -106,6 +109,9 @@ private:
   double bin_size_;      // = params_.z_hist_bin
   int    max_empty_bins_; // allowed consecutive empty bins within δ
   int    bin_min_count_; // occupancy threshold per bin
+  double z_shift_thresh_; // z movement threshold for recentering
+  double hist_z_center_; // current center z of histogram (robot-relative)
+  double hist_z_min_, hist_z_max_; // current histogram bounds (absolute)
 
   // Big grid ring buffer & origin
   mutable std::mutex m_;
@@ -114,7 +120,7 @@ private:
   std::vector<uint8_t> occ_b_;
   std::vector<float>   stamp_b_;
   int start_i_{0}, start_j_{0};
-  double origin_x_{0.0}, origin_y_{0.0};
+  double origin_x_{0.0}, origin_y_{0.0}, robot_z_{0.0};
   bool have_origin_{false};
 
   // NEW: per-cell z-aggregator + cached boundary-connected height

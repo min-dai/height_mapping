@@ -10,8 +10,8 @@ int main() {
   height_mapping::HeightMap map(P);
 
   // Robot at origin; ensure origin and insert a little ramp + step
-  float robot_x = 0.0; float robot_y = 0.0; float robot_yaw = 0.0;
-  map.ensureOrigin(robot_x, robot_y);
+  float robot_x = 0.0; float robot_y = 0.0; float robot_z = 0.0; float robot_yaw = 0.0;
+  map.ensureOrigin(robot_x, robot_y, robot_z);
   std::vector<height_mapping::Point3f> pts;
   float max_x = -1000.0f, min_x = 1000.0f;
   float max_y = -1000.0f, min_y = 1000.0f;

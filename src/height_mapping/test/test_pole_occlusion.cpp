@@ -9,8 +9,8 @@ int main() {
   height_mapping::HeightMap map(P);
 
   // Robot at origin; ensure origin and insert a little ramp + step
-  float robot_x = 0.0; float robot_y = 0.0; float robot_yaw = 0.0;
-  map.ensureOrigin(robot_x, robot_y);
+  float robot_x = 0.0; float robot_y = 0.0; float robot_z = 0.0; float robot_yaw = 0.0;
+  map.ensureOrigin(robot_x, robot_y, robot_z);
   std::vector<height_mapping::Point3f> pts;
   for (int k = 0; k < 20000; ++k) {
     float x = -3.0f + 6.0f*float(rand())/RAND_MAX;

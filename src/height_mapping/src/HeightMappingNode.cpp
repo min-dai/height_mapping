@@ -1,8 +1,6 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
-#include <sensor_msgs/msg/image.hpp>
-#include <nav_msgs/msg/map_meta_data.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 
 #include <tf2_ros/transform_listener.h>
@@ -10,7 +8,6 @@
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Matrix3x3.h>
 
-#include <cv_bridge/cv_bridge.h>
 #include <opencv2/core.hpp>
 
 #include <pcl/filters/voxel_grid.h>
@@ -26,7 +23,7 @@ public:
 
     // --- params ---
     height_mapping::Params P;
-    map_frame_    = declare_parameter<std::string>("map_frame", "camera_init");
+    map_frame_    = declare_parameter<std::string>("map_frame", "odom");
     base_frame_   = declare_parameter<std::string>("base_frame", "body");
     topic_cloud_  = declare_parameter<std::string>("topic_cloud", "/cloud_registered");
     lidar_frame_  = declare_parameter<std::string>("livox_frame", "");
@@ -35,6 +32,7 @@ public:
     P.Wb          = declare_parameter<int>("big_width", 400);
     P.Hb          = declare_parameter<int>("big_height", 400);
     P.max_h       = declare_parameter<double>("max_height", 2.0);
+    max_height_   = P.max_h;
     P.z_min       = declare_parameter<double>("z_min", -1.0);
     P.z_max       = declare_parameter<double>("z_max",  2.0);
     P.drop_thresh = declare_parameter<double>("drop_thresh", 0.07);
@@ -53,9 +51,8 @@ public:
     mapper_ = std::make_shared<height_mapping::HeightMap>(P);
 
     // pubs/subs
-    pub_raw_  = create_publisher<sensor_msgs::msg::Image>("height_grid/sub_raw", 1);
-    pub_fill_ = create_publisher<sensor_msgs::msg::Image>("height_grid/sub_filled", 1);
-    pub_meta_ = create_publisher<nav_msgs::msg::MapMetaData>("height_grid/meta", 1);
+    pub_raw_  = create_publisher<sensor_msgs::msg::PointCloud2>("height_grid/sub_raw", 1);
+    pub_fill_ = create_publisher<sensor_msgs::msg::PointCloud2>("height_grid/sub_filled", 1);
 
     sub_cloud_ = create_subscription<sensor_msgs::msg::PointCloud2>(
       topic_cloud_, rclcpp::SensorDataQoS(),
@@ -75,18 +72,19 @@ public:
   }
 
 private:
-  bool getRobotPose(const rclcpp::Time& t, double& x, double& y, double& yaw) {
+  bool getRobotPose(const rclcpp::Time& t, double& x, double& y, double& z, double& yaw) {
     try {
       RCLCPP_DEBUG(get_logger(), "Attempting TF lookup: %s -> %s", map_frame_.c_str(), base_frame_.c_str());
       // Try with exact timestamp first
       auto T = tf_buffer_.lookupTransform(map_frame_, base_frame_, t, tf2::durationFromSec(0.2));
       x = T.transform.translation.x;
       y = T.transform.translation.y;
+      z = T.transform.translation.z;
       const auto &q = T.transform.rotation;
       tf2::Quaternion qq(q.x, q.y, q.z, q.w);
       tf2::Matrix3x3 R(qq);
       double roll, pitch; R.getRPY(roll, pitch, yaw);
-      RCLCPP_DEBUG(get_logger(), "TF lookup success: pose (%.2f, %.2f, %.2f)", x, y, yaw);
+      RCLCPP_DEBUG(get_logger(), "TF lookup success: pose (%.2f, %.2f, %.2f, %.2f)", x, y, z, yaw);
       return true;
     } catch (const tf2::ExtrapolationException& e) {
       // If extrapolation fails, try with latest available transform
@@ -95,11 +93,12 @@ private:
         auto T = tf_buffer_.lookupTransform(map_frame_, base_frame_, tf2::TimePointZero);
         x = T.transform.translation.x;
         y = T.transform.translation.y;
+        z = T.transform.translation.z;
         const auto &q = T.transform.rotation;
         tf2::Quaternion qq(q.x, q.y, q.z, q.w);
         tf2::Matrix3x3 R(qq);
         double roll, pitch; R.getRPY(roll, pitch, yaw);
-        RCLCPP_DEBUG(get_logger(), "TF lookup success with latest: pose (%.2f, %.2f, %.2f)", x, y, yaw);
+        RCLCPP_DEBUG(get_logger(), "TF lookup success with latest: pose (%.2f, %.2f, %.2f, %.2f)", x, y, z, yaw);
         return true;
       } catch (const std::exception& e2) {
         RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "TF lookup failed (latest): %s", e2.what());
@@ -116,15 +115,15 @@ private:
                          msg->width * msg->height);
     
     // TF: ensure origin & recenter
-    double rx, ry, rYaw;
-    if (!getRobotPose(msg->header.stamp, rx, ry, rYaw)) {
+    double rx, ry, rz, rYaw;
+    if (!getRobotPose(msg->header.stamp, rx, ry, rz, rYaw)) {
       RCLCPP_DEBUG(get_logger(), "Skipping cloud processing - no robot pose");
       return;
     }
-    RCLCPP_DEBUG(get_logger(), "Processing cloud at robot pose (%.2f, %.2f, %.2f)", rx, ry, rYaw);
+    RCLCPP_DEBUG(get_logger(), "Processing cloud at robot pose (%.2f, %.2f, %.2f, %.2f)", rx, ry, rz, rYaw);
     
-    mapper_->ensureOrigin(rx, ry);
-    mapper_->recenterIfNeeded(rx, ry);
+    mapper_->ensureOrigin(rx, ry, rz);
+    mapper_->recenterIfNeeded(rx, ry, rz);
 
     // Optional voxel DS (still in ROS layer)
     const sensor_msgs::msg::PointCloud2 *cloud_in = msg.get();
@@ -202,8 +201,8 @@ private:
     RCLCPP_DEBUG(get_logger(), "Publish timer callback triggered");
     
     // Pose at publish time
-    double rx, ry, rYaw;
-    if (!getRobotPose(now(), rx, ry, rYaw)) {
+    double rx, ry, rz, rYaw;
+    if (!getRobotPose(now(), rx, ry, rz, rYaw)) {
       RCLCPP_DEBUG(get_logger(), "Skipping publish - no robot pose");
       return;
     }
@@ -212,41 +211,139 @@ private:
       return;
     }
 
-    RCLCPP_DEBUG(get_logger(), "Generating subgrid at pose (%.2f, %.2f, %.2f)", rx, ry, rYaw);
+    RCLCPP_DEBUG(get_logger(), "Generating subgrid at pose (%.2f, %.2f, %.2f, %.2f)", rx, ry, rz, rYaw);
     cv::Mat sub_raw, sub_filled;
     height_mapping::SubgridMeta meta;
     mapper_->generateSubgrid(rx, ry, rYaw, sub_raw, sub_filled, meta);
     RCLCPP_DEBUG(get_logger(), "Subgrid generated: %dx%d", meta.width, meta.height);
 
-    // Publish images
+    // Publish height point clouds
     auto stamp = now();
-    auto msg_raw = cv_bridge::CvImage(std_msgs::msg::Header(), "32FC1", sub_raw).toImageMsg();
-    msg_raw->header.stamp = stamp;
-    msg_raw->header.frame_id = map_frame_;
-    pub_raw_->publish(*msg_raw);
-
-    auto msg_fill = cv_bridge::CvImage(std_msgs::msg::Header(), "32FC1", sub_filled).toImageMsg();
-    msg_fill->header.stamp = stamp;
-    msg_fill->header.frame_id = map_frame_;
-    pub_fill_->publish(*msg_fill);
-
-    // Publish meta (origin + yaw encoded)
-    nav_msgs::msg::MapMetaData mm;
-    mm.map_load_time = stamp;
-    mm.resolution = meta.resolution;
-    mm.width  = meta.width;
-    mm.height = meta.height;
-    mm.origin.position.x = meta.origin_x;
-    mm.origin.position.y = meta.origin_y;
-    mm.origin.position.z = 0.0;
-    // yaw-only quaternion
-    double cy = std::cos(0.5*meta.yaw), sy = std::sin(0.5*meta.yaw);
-    mm.origin.orientation.x = 0.0;
-    mm.origin.orientation.y = 0.0;
-    mm.origin.orientation.z = sy;
-    mm.origin.orientation.w = cy;
-
-    pub_meta_->publish(mm);
+    
+    // Convert height maps to point clouds
+    auto createPointCloud = [&](const cv::Mat& height_mat) {
+      auto cloud = std::make_shared<sensor_msgs::msg::PointCloud2>();
+      cloud->header.stamp = stamp;
+      cloud->header.frame_id = map_frame_;
+      
+      // Set up point cloud structure: XYZ + RGB
+      cloud->width = meta.width * meta.height;
+      cloud->height = 1;
+      cloud->is_dense = false;
+      
+      // Point cloud fields: x, y, z, rgb
+      cloud->fields.resize(4);
+      cloud->fields[0].name = "x";
+      cloud->fields[0].offset = 0;
+      cloud->fields[0].datatype = sensor_msgs::msg::PointField::FLOAT32;
+      cloud->fields[0].count = 1;
+      
+      cloud->fields[1].name = "y"; 
+      cloud->fields[1].offset = 4;
+      cloud->fields[1].datatype = sensor_msgs::msg::PointField::FLOAT32;
+      cloud->fields[1].count = 1;
+      
+      cloud->fields[2].name = "z";
+      cloud->fields[2].offset = 8; 
+      cloud->fields[2].datatype = sensor_msgs::msg::PointField::FLOAT32;
+      cloud->fields[2].count = 1;
+      
+      cloud->fields[3].name = "rgb";
+      cloud->fields[3].offset = 12;
+      cloud->fields[3].datatype = sensor_msgs::msg::PointField::UINT32;
+      cloud->fields[3].count = 1;
+      
+      cloud->point_step = 16; // 4 floats * 4 bytes
+      cloud->row_step = cloud->point_step * cloud->width;
+      cloud->data.resize(cloud->row_step);
+      
+      // First pass: find min/max heights in valid data
+      float min_height = std::numeric_limits<float>::infinity();
+      float max_height_data = -std::numeric_limits<float>::infinity();
+      
+      for (int i = 0; i < meta.height; ++i) {
+        const float* row = height_mat.ptr<float>(i);
+        for (int j = 0; j < meta.width; ++j) {
+          float height = row[j];
+          if (!std::isnan(height) && !std::isinf(height)) {
+            min_height = std::min(min_height, height);
+            max_height_data = std::max(max_height_data, height);
+          }
+        }
+      }
+      
+      // Handle case where no valid data exists
+      if (std::isinf(min_height)) {
+        min_height = 0.0f;
+        max_height_data = 1.0f;
+      }
+      
+      // Avoid division by zero
+      float height_range = max_height_data - min_height;
+      if (height_range < 1e-6f) {
+        height_range = 1.0f;
+      }
+      
+      // Convert height map to 3D points with height-based coloring
+      int point_idx = 0;
+      float* data_ptr = reinterpret_cast<float*>(cloud->data.data());
+      uint32_t* rgb_ptr = reinterpret_cast<uint32_t*>(cloud->data.data() + 12);
+      
+      for (int i = 0; i < meta.height; ++i) {
+        const float* row = height_mat.ptr<float>(i);
+        for (int j = 0; j < meta.width; ++j) {
+          float height = row[j];
+          
+          if (std::isnan(height) || std::isinf(height)) {
+            // Skip invalid points
+            continue;
+          }
+          
+          // World coordinates for this grid cell - use same transform as generateSubgrid
+          const double halfW = 0.5 * meta.width * meta.resolution;
+          const double halfH = 0.5 * meta.height * meta.resolution;
+          const double gx = (static_cast<double>(j) + 0.5) * meta.resolution - halfW;
+          const double gy = (static_cast<double>(i) + 0.5) * meta.resolution - halfH;
+          
+          // Apply rotation (same as generateSubgrid)
+          const double c = std::cos(meta.yaw), s = std::sin(meta.yaw);
+          // Extract robot position from meta.origin (which is bottom-left corner)
+          const double rx = meta.origin_x - c*(-halfW) + s*(-halfH);
+          const double ry = meta.origin_y - s*(-halfW) - c*(-halfH);
+          
+          double world_x = rx + c*gx - s*gy;
+          double world_y = ry + s*gx + c*gy;
+          
+          // Set XYZ
+          data_ptr[point_idx * 4 + 0] = static_cast<float>(world_x);
+          data_ptr[point_idx * 4 + 1] = static_cast<float>(world_y); 
+          data_ptr[point_idx * 4 + 2] = height;
+          
+          // Height-based coloring using actual data range: blue (low) to red (high)
+          float normalized_height = (height - min_height) / height_range;
+          normalized_height = std::max(0.0f, std::min(1.0f, normalized_height));
+          
+          uint8_t r = static_cast<uint8_t>(normalized_height * 255);
+          uint8_t g = static_cast<uint8_t>((1.0f - normalized_height) * normalized_height * 4 * 255);
+          uint8_t b = static_cast<uint8_t>((1.0f - normalized_height) * 255);
+          uint32_t rgb = (static_cast<uint32_t>(r) << 16) | 
+                        (static_cast<uint32_t>(g) << 8) | 
+                        static_cast<uint32_t>(b);
+          
+          rgb_ptr[point_idx] = rgb;
+          point_idx++;
+        }
+      }
+      
+      // Update actual point count
+      cloud->width = point_idx;
+      cloud->data.resize(point_idx * cloud->point_step);
+      
+      return cloud;
+    };
+    
+    pub_raw_->publish(*createPointCloud(sub_raw));
+    pub_fill_->publish(*createPointCloud(sub_filled));
     RCLCPP_DEBUG(get_logger(), "Published height maps and metadata");
   }
 
@@ -256,10 +353,10 @@ private:
   double publish_rate_{10.0};
   bool use_voxel_ds_{false}, transform_cloud_if_needed_{true};
   double voxel_leaf_{0.05};
+  double max_height_{2.0};
 
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_cloud_;
-  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_raw_, pub_fill_;
-  rclcpp::Publisher<nav_msgs::msg::MapMetaData>::SharedPtr pub_meta_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_raw_, pub_fill_;
   rclcpp::TimerBase::SharedPtr timer_;
 
   tf2_ros::Buffer tf_buffer_;

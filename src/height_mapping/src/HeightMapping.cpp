@@ -206,7 +206,6 @@ void HeightMap::shiftRingBuffer_(int si, int sj) {
 
 void HeightMap::recenterIfNeeded(double robot_x, double robot_y, double robot_z) {
   if (!have_origin_) return;
-  std::cout << "Pre-centered: origin=(" << origin_x_ << "," << origin_y_ << "), robot_z=" << robot_z_ << std::endl;
   
   // Check x,y recentering
   const double cx = origin_x_ + 0.5 * Wb_ * res_;
@@ -234,7 +233,6 @@ void HeightMap::recenterIfNeeded(double robot_x, double robot_y, double robot_z)
       shiftRingBuffer_(-si, -sj);
     }
   }
-  std::cout << "Recentered: origin=(" << origin_x_ << "," << origin_y_ << "), robot_z=" << robot_z_ << std::endl;
 }
 
 // --- per-cell histogram update ---
@@ -382,14 +380,14 @@ void HeightMap::solveGlobalFill_()
 
   // ---------- Build occlusion mask & edge clusters ----------
   PROFILE_START(connected_components);
-  cv::Mat occ_mask = (big_occluded > 0); // CV_8U, 0/255 interior=in mask  TODO: why not just use big_occluded directly?
+  // cv::Mat occ_mask = (big_occluded > 0); // CV_8U, 0/255 interior=in mask  TODO: why not just use big_occluded directly?
   cv::Mat occluded_labels;
-  const int n_labels = cv::connectedComponents(occ_mask, occluded_labels, 4, CV_32S);
+  const int n_labels = cv::connectedComponents(big_occluded, occluded_labels, 4, CV_32S);
   PROFILE_END(connected_components);
   std::vector<uint8_t> cluster_touches_edge(std::max(1, n_labels), 0);
 
   auto mark_if_edge = [&](int i, int j) {
-    if (!occ_mask.at<uint8_t>(i,j)) return;
+    if (!big_occluded.at<uint8_t>(i,j)) return;
     const int lbl = occluded_labels.at<int>(i,j);
     cluster_touches_edge[lbl] = 1;
   };
@@ -400,91 +398,99 @@ void HeightMap::solveGlobalFill_()
   // Any occluded cell whose component touches the outer border: set to max and remove from mask
   PROFILE_START(set_boundary_occlusions);
   // TODO: do we need the additional clones? we have already coppied height_b
-  cv::Mat working_mask = occ_mask.clone(); // we'll edit this
-  cv::Mat solver_field = big_height.clone(); // used by the PDE
   for (int i = 0; i < Hb_; ++i) {
-    uint8_t* working_mask_row = working_mask.ptr<uint8_t>(i);
-    float*   solver_field_row = solver_field.ptr<float>(i);
+    uint8_t* big_occluded_row = big_occluded.ptr<uint8_t>(i);
+    float*   big_height_row = big_height.ptr<float>(i);
     for (int j = 0; j < Wb_; ++j) {
-      if (!working_mask_row[j]) continue;
+      if (!big_occluded_row[j]) continue;
       const int lbl = occluded_labels.at<int>(i,j);
       if (cluster_touches_edge[lbl]) {
-        solver_field_row[j] = static_cast<float>(max_h_ + robot_z_);
-        working_mask_row[j] = 0; // don't solve there TOOO: we can just use occ_mask here?
+        big_height_row[j] = static_cast<float>(max_h_ + robot_z_);
+        big_occluded_row[j] = 0;
       }
     }
   }
   PROFILE_END(set_boundary_occlusions);
-  PROFILE_SAVE_PNG(working_mask * 255, "working_mask0" + run_suffix + ".png");
-  PROFILE_SAVE_PNG(solver_field, "solver_field0" + run_suffix + ".png");
+  PROFILE_SAVE_PNG(big_occluded * 255, "big_occluded1" + run_suffix + ".png");
+  PROFILE_SAVE_PNG(big_height, "big_height1" + run_suffix + ".png");
 
   // ---------- Dirichlet boundary only for the PDE (do NOT persist into output) ----------
   PROFILE_START(update_boundary_conditions);
   // Boundary = observed cells that are 4-neighbors of currently occluded cells
   for (int i = 0; i < Hb_; ++i) {
-    uint8_t* mrow = working_mask.ptr<uint8_t>(i);
-    float* sf_row = solver_field.ptr<float>(i);
+    uint8_t* mrow = big_occluded.ptr<uint8_t>(i);
+    float* h_row = big_height.ptr<float>(i);
     for (int j = 0; j < Wb_; ++j) {
       if (!mrow[j]) {
         continue;
       }
       bool updated = false;
-      if (i > 0     && !working_mask.at<uint8_t>(i-1,j)) {
+      if (i > 0     && !big_occluded.at<uint8_t>(i-1,j)) {
         // neighbor is known
-        solver_field.at<float>(i-1,j)= big_boundary_conn.at<float>(i-1,j);
+        big_height.at<float>(i-1,j)= big_boundary_conn.at<float>(i-1,j);
       }
-      if (i+1 < Hb_ && !working_mask.at<uint8_t>(i+1,j)) {
+      if (i+1 < Hb_ && !big_occluded.at<uint8_t>(i+1,j)) {
         // neighbor is known
-        solver_field.at<float>(i+1,j) = big_boundary_conn.at<float>(i+1,j);
+        big_height.at<float>(i+1,j) = big_boundary_conn.at<float>(i+1,j);
       }
-      if (j > 0     && !working_mask.at<uint8_t>(i,j-1)) {
+      if (j > 0     && !big_occluded.at<uint8_t>(i,j-1)) {
         // neighbor is known
-        sf_row[j] = big_boundary_conn.at<float>(i,j-1);
+        h_row[j-1] = big_boundary_conn.at<float>(i,j-1);
       }
-      if (j+1 < Wb_ && !working_mask.at<uint8_t>(i,j+1)) {
+      if (j+1 < Wb_ && !big_occluded.at<uint8_t>(i,j+1)) {
         // neighbor is known
-        sf_row[j+1] = big_boundary_conn.at<float>(i,j+1);;
+        h_row[j+1] = big_boundary_conn.at<float>(i,j+1);;
+      }
+
+      //Diagonals
+      if (i > 0 && j > 0 && !big_occluded.at<uint8_t>(i-1,j-1)) {
+        // neighbor is known
+        big_height.at<float>(i-1,j-1)= big_boundary_conn.at<float>(i-1,j-1);
+      }
+      if (i+1 < Hb_ && j > 0 && !big_occluded.at<uint8_t>(i+1,j-1)) {
+        // neighbor is known
+        big_height.at<float>(i+1,j-1) = big_boundary_conn.at<float>(i+1,j-1);
+      }
+      if (i > 0 && j+1 <  Wb_ && !big_occluded.at<uint8_t>(i-1,j+1)) {
+        // neighbor is known
+        big_height.at<float>(i-1,j+1) = big_boundary_conn.at<float>(i-1,j+1);
+      }
+      if (i+1 < Hb_ && j+1 <  Wb_ && !big_occluded.at<uint8_t>(i+1,j+1)) {
+        // neighbor is known
+        big_height.at<float>(i+1,j+1) = big_boundary_conn.at<float>(i+1,j+1);
       }
     }
   }
   PROFILE_END(update_boundary_conditions);
 
   PROFILE_SAVE_PNG(big_boundary_conn, "big_boundary_conn1" + run_suffix + ".png");
-  // working_mask &= changed_working_mask == 0; // add these new boundary pixels to the PDE mask
-  // PROFILE_SAVE_PNG(changed_working_mask * 255, "changed_working_mask" + run_suffix + ".png");
-  PROFILE_SAVE_PNG(working_mask * 255, "working_mask1" + run_suffix + ".png");
-  PROFILE_SAVE_PNG(solver_field, "solver_field1" + run_suffix + ".png");
+  PROFILE_SAVE_PNG(big_occluded * 255, "big_occluded2" + run_suffix + ".png");
+  PROFILE_SAVE_PNG(big_height, "big_height2" + run_suffix + ".png");
 
   // ---------- Warm start & clamp ----------
   PROFILE_START(laplace_solve);
   // If we have a previous full-grid solution matching the current size, warm-start the interior
   if (!prev_fill_full_.empty() &&
       prev_fill_full_.rows == Hb_ && prev_fill_full_.cols == Wb_) {
-    prev_fill_full_.copyTo(solver_field, working_mask);
-    harmonicFillROI_(solver_field, working_mask,
+    prev_fill_full_.copyTo(big_height, big_occluded);
+    harmonicFillROI_(big_height, big_occluded,
                      -std::numeric_limits<float>::infinity(),
                       std::numeric_limits<float>::infinity(),
                      /*iters=*/80, /*eps=*/1e-3f, /*init_interior=*/false);
   } else {
     // Conservative clamp from boundary (observed) values
-    cv::Mat invMask; cv::bitwise_not(working_mask, invMask);
+    cv::Mat invMask; cv::bitwise_not(big_occluded, invMask);
     double min_b = 0.0, max_b = 0.0;
-    cv::minMaxLoc(solver_field, &min_b, &max_b, nullptr, nullptr, invMask);
+    cv::minMaxLoc(big_height, &min_b, &max_b, nullptr, nullptr, invMask);
     const float lo = std::isfinite(min_b) ? static_cast<float>(min_b) : 0.0f;
     const float hi = std::isfinite(max_b) ? static_cast<float>(max_b) : static_cast<float>(max_h_ + robot_z_);
-    harmonicFillROI_(solver_field, working_mask, lo, hi, /*iters=*/80, /*eps=*/1e-3f, /*init_interior=*/true);
+    harmonicFillROI_(big_height, big_occluded, lo, hi, /*iters=*/80, /*eps=*/1e-3f, /*init_interior=*/true);
   }
   PROFILE_END(laplace_solve);
 
   // ---------- Build final field: keep observed cells as raw heights ----------
-  //  TODO: is this copying necessary
-  // cv::Mat final_field = big_height.clone();           // observed stay raw
-  // solver_field.copyTo(final_field, working_mask);     // only interior pixels get the PDE result
-  prev_fill_full_ = solver_field;                      // cache for warm start next time
-
-  PROFILE_SAVE_PNG(solver_field, "final_field" + run_suffix + ".png");
-  PROFILE_SAVE_PNG(working_mask * 255, "working_mask2" + run_suffix + ".png");
-  // PROFILE_SAVE_PNG(solver_field, "solver_field2" + run_suffix + ".png");
+  PROFILE_SAVE_PNG(big_height, "big_height3" + run_suffix + ".png");
+  PROFILE_SAVE_PNG(big_occluded * 255, "big_occluded3" + run_suffix + ".png");
 
   // ---------- Write back if the grid didn't shift while we solved ----------
   PROFILE_START(copy_to_ringbuffer);
@@ -501,9 +507,9 @@ void HeightMap::solveGlobalFill_()
     const size_t N = static_cast<size_t>(Hb_) * static_cast<size_t>(Wb_);
     if (filled_b_.size() != N) filled_b_.assign(N, static_cast<float>(max_h_ + robot_z_));
     for (int i = 0; i < Hb_; ++i) {
-      const float* row = solver_field.ptr<float>(i);
+      const float* h_row = big_height.ptr<float>(i);
       for (int j = 0; j < Wb_; ++j) {
-        filled_b_[idxRB(i, j)] = row[j];  // map to current ring-buffer storage
+        filled_b_[idxRB(i, j)] = h_row[j];  // map to current ring-buffer storage
       }
     }
   }
@@ -611,101 +617,6 @@ void HeightMap::ingestPoints(const std::vector<Point3f>& pts) {
   solveGlobalFill_();
 }
 
-inline void HeightMap::sampleFilled_(double wx, double wy, float& h_fill) const
-{
-  const double uf = (wx - origin_x_) / res_;
-  const double vf = (wy - origin_y_) / res_;
-  const int j0 = static_cast<int>(std::floor(uf));
-  const int i0 = static_cast<int>(std::floor(vf));
-  const double du = uf - j0;
-  const double dv = vf - i0;
-
-  if (i0 < 0 || i0 + 1 >= Hb_ || j0 < 0 || j0 + 1 >= Wb_) {
-    h_fill = static_cast<float>(max_h_ + robot_z_);
-    return;
-  }
-
-  float f00, f10, f01, f11;
-  {
-    std::lock_guard<std::mutex> lk(m_);
-    size_t id00 = idxRB(i0,   j0  );
-    size_t id10 = idxRB(i0,   j0+1);
-    size_t id01 = idxRB(i0+1, j0  );
-    size_t id11 = idxRB(i0+1, j0+1);
-    const std::vector<float>& src = filled_b_.empty() ? height_b_ : filled_b_;
-    f00 = src[id00]; f10 = src[id10];
-    f01 = src[id01]; f11 = src[id11];
-  }
-  const double w00 = (1.0 - du)*(1.0 - dv);
-  const double w10 = (du)      *(1.0 - dv);
-  const double w01 = (1.0 - du)*(dv);
-  const double w11 = (du)      *(dv);
-  h_fill = static_cast<float>(w00*f00 + w10*f10 + w01*f01 + w11*f11);
-}
-
-void HeightMap::sampleBilinearBoth_(double wx, double wy,
-                                    float& h_raw, float& h_bound,
-                                    uint8_t& occ_val, uint8_t& edge_touch) const {
-  const double uf = (wx - origin_x_) / res_;
-  const double vf = (wy - origin_y_) / res_;
-
-  const int j0 = static_cast<int>(std::floor(uf));
-  const int i0 = static_cast<int>(std::floor(vf));
-  const double du = uf - j0;
-  const double dv = vf - i0;
-
-  if (i0 < 0 || i0 + 1 >= Hb_ || j0 < 0 || j0 + 1 >= Wb_) {
-    h_raw = static_cast<float>(max_h_ + robot_z_);
-    h_bound = static_cast<float>(max_h_ + robot_z_);
-    occ_val = 1;
-    edge_touch = 1;
-    return;
-  }
-
-  float h00,h10,h01,h11;
-  float b00,b10,b01,b11;
-  uint8_t k00,k10,k01,k11;
-  uint8_t o00,o10,o01,o11;
-  {
-    std::lock_guard<std::mutex> lk(m_);
-    size_t id00 = idxRB(i0,   j0  );
-    size_t id10 = idxRB(i0,   j0+1);
-    size_t id01 = idxRB(i0+1, j0  );
-    size_t id11 = idxRB(i0+1, j0+1);
-    h00 = height_b_[id00]; h10 = height_b_[id10];
-    h01 = height_b_[id01]; h11 = height_b_[id11];
-
-    b00 = hconn_b_[id00];  b10 = hconn_b_[id10];
-    b01 = hconn_b_[id01];  b11 = hconn_b_[id11];
-
-    k00 = known_b_[id00];  k10 = known_b_[id10];
-    k01 = known_b_[id01];  k11 = known_b_[id11];
-
-    o00 = occ_b_[id00];    o10 = occ_b_[id10];
-    o01 = occ_b_[id01];    o11 = occ_b_[id11];
-  }
-
-  const double w00 = k00 ? (1.0 - du)*(1.0 - dv) : 0.0;
-  const double w10 = k10 ? (du)      *(1.0 - dv) : 0.0;
-  const double w01 = k01 ? (1.0 - du)*(dv)       : 0.0;
-  const double w11 = k11 ? (du)      *(dv)       : 0.0;
-  const double wsum = w00 + w10 + w01 + w11;
-
-  if (k00 || k10 || k01 || k11) {
-    const double h_interp = (w00*h00 + w10*h10 + w01*h01 + w11*h11) / wsum;
-    const double b_interp = (w00*b00 + w10*b10 + w01*b01 + w11*b11) / wsum;
-    h_raw   = static_cast<float>(h_interp);
-    h_bound = static_cast<float>(b_interp);
-    occ_val = 0;
-  } else {
-    h_raw   = static_cast<float>(max_h_ + robot_z_);
-    h_bound = static_cast<float>(max_h_ + robot_z_);
-    occ_val = 1;
-  }
-  edge_touch = 0;
-}
-
-// (Kept for parity; no longer used when solving globally before sampling)
 
 void HeightMap::generateSubgrid(double rx, double ry, double rYaw,
                                 cv::Mat& sub_raw, cv::Mat& sub_filled, SubgridMeta& meta) const
@@ -714,7 +625,7 @@ void HeightMap::generateSubgrid(double rx, double ry, double rYaw,
   const int Wb = Wb_, Hb = Hb_;
   double origin_x, origin_y, res;
   int start_i, start_j;
-  double max_h = max_h_ + robot_z_;
+  const double max_h = max_h_ + robot_z_;
 
   // Local copies of ring-buffered arrays (flat, row-major)
   std::vector<float> snap_height;
@@ -738,7 +649,7 @@ void HeightMap::generateSubgrid(double rx, double ry, double rYaw,
     snap_occ    = occ_b_;      // 0/1
 
     // If we have a filled field, copy; else leave empty and we’ll fall back to snap_height.
-    if (!filled_b_.empty()) snap_filled = filled_b_;
+    snap_filled = (!filled_b_.empty()) ? filled_b_ : height_b_;
   }
 
   auto idxRB_local = [&](int i, int j) -> size_t {
@@ -748,10 +659,7 @@ void HeightMap::generateSubgrid(double rx, double ry, double rYaw,
     return static_cast<size_t>(ri) * Wb + static_cast<size_t>(rj);
   };
 
-  auto sampleBilinearRawBoundUnlocked = [&](double wx, double wy,
-                                            float& h_raw, float& h_bound,
-                                            uint8_t& occ_val) {
-    // world -> big-grid fractional indices (column = x, row = y)
+  auto sampleBilinear = [&](double wx, double wy, float& h_raw, float& h_fill) {
     const double uf = (wx - origin_x) / res;
     const double vf = (wy - origin_y) / res;
 
@@ -761,53 +669,7 @@ void HeightMap::generateSubgrid(double rx, double ry, double rYaw,
     const double dv = vf - i0;
 
     if (i0 < 0 || i0 + 1 >= Hb || j0 < 0 || j0 + 1 >= Wb) {
-      h_raw   = static_cast<float>(max_h);
-      h_bound = static_cast<float>(max_h);
-      occ_val = 1;
-      return;
-    }
-
-    const size_t id00 = idxRB_local(i0,   j0  );
-    const size_t id10 = idxRB_local(i0,   j0+1);
-    const size_t id01 = idxRB_local(i0+1, j0  );
-    const size_t id11 = idxRB_local(i0+1, j0+1);
-
-    const float h00 = snap_height[id00], h10 = snap_height[id10];
-    const float h01 = snap_height[id01], h11 = snap_height[id11];
-
-    const float b00 = snap_hconn[id00],  b10 = snap_hconn[id10];
-    const float b01 = snap_hconn[id01],  b11 = snap_hconn[id11];
-
-    const uint8_t k00 = snap_known[id00], k10 = snap_known[id10];
-    const uint8_t k01 = snap_known[id01], k11 = snap_known[id11];
-
-    const double w00 = k00 ? (1.0 - du)*(1.0 - dv) : 0.0;
-    const double w10 = k10 ? (du)      *(1.0 - dv) : 0.0;
-    const double w01 = k01 ? (1.0 - du)*(dv)       : 0.0;
-    const double w11 = k11 ? (du)      *(dv)       : 0.0;
-    const double wsum = w00 + w10 + w01 + w11;
-
-    if (wsum > 0.0) {
-      h_raw   = static_cast<float>((w00*h00 + w10*h10 + w01*h01 + w11*h11) / wsum);
-      h_bound = static_cast<float>((w00*b00 + w10*b10 + w01*b01 + w11*b11) / wsum);
-      occ_val = 0;
-    } else {
-      h_raw   = static_cast<float>(max_h);
-      h_bound = static_cast<float>(max_h);
-      occ_val = 1;
-    }
-  };
-
-  auto sampleBilinearFilledUnlocked = [&](double wx, double wy, float& h_fill) {
-    const double uf = (wx - origin_x) / res;
-    const double vf = (wy - origin_y) / res;
-
-    const int j0 = static_cast<int>(std::floor(uf));
-    const int i0 = static_cast<int>(std::floor(vf));
-    const double du = uf - j0;
-    const double dv = vf - i0;
-
-    if (i0 < 0 || i0 + 1 >= Hb || j0 < 0 || j0 + 1 >= Wb) {
+      h_raw = static_cast<float>(max_h);
       h_fill = static_cast<float>(max_h);
       return;
     }
@@ -825,36 +687,31 @@ void HeightMap::generateSubgrid(double rx, double ry, double rYaw,
 
     const int known_cnt = (k00!=0) + (k10!=0) + (k01!=0) + (k11!=0);
 
-    if (known_cnt > 0) {
-      // Use the SAME known-aware bilinear as the raw view -> identical outside occlusion.
-      const double w00 = k00 ? (1.0 - du)*(1.0 - dv) : 0.0;
-      const double w10 = k10 ? (du)      *(1.0 - dv) : 0.0;
-      const double w01 = k01 ? (1.0 - du)*(dv)       : 0.0;
-      const double w11 = k11 ? (du)      *(dv)       : 0.0;
-      const double wsum = w00 + w10 + w01 + w11;
-
-      // Use the raw heights here (observed corners)
-      const float h00 = snap_height[id00], h10 = snap_height[id10];
-      const float h01 = snap_height[id01], h11 = snap_height[id11];
-
-      if (wsum > 0.0) {
-        h_fill = static_cast<float>((w00*h00 + w10*h10 + w01*h01 + w11*h11) / wsum);
-      } else {
-        // Shouldn’t happen if known_cnt > 0, but be safe:
-        h_fill = static_cast<float>(max_h);
-      }
-      return;
-    }
-
-    // All four corners are unknown -> show the PDE solution
-    const std::vector<float>& src = snap_filled.empty() ? snap_height : snap_filled;
-    const float f00 = src[id00], f10 = src[id10];
-    const float f01 = src[id01], f11 = src[id11];
-
     const double w00 = (1.0 - du)*(1.0 - dv);
     const double w10 = (du)      *(1.0 - dv);
     const double w01 = (1.0 - du)*(dv);
     const double w11 = (du)      *(dv);
+
+    if (known_cnt > 0) {
+      // Use the SAME known-aware bilinear as the raw view -> identical outside occlusion.
+      const double kw00 = k00 ? w00 : 0.0;
+      const double kw10 = k10 ? w10 : 0.0;
+      const double kw01 = k01 ? w01 : 0.0;
+      const double kw11 = k11 ? w11 : 0.0;
+      const double kwsum = w00 + w10 + w01 + w11;
+
+      // Use the raw heights here (observed corners)
+      const float h00 = snap_height[id00], h10 = snap_height[id10];
+      const float h01 = snap_height[id01], h11 = snap_height[id11];
+      
+      h_raw = static_cast<float>((kw00*h00 + kw10*h10 + kw01*h01 + kw11*h11) / kwsum);
+    } else {
+      h_raw = static_cast<float>(max_h);
+    }
+
+    // Show the PDE solution
+    const float f00 = snap_filled[id00], f10 = snap_filled[id10];
+    const float f01 = snap_filled[id01], f11 = snap_filled[id11];
 
     h_fill = static_cast<float>(w00*f00 + w10*f10 + w01*f01 + w11*f11);
   };
@@ -880,12 +737,9 @@ void HeightMap::generateSubgrid(double rx, double ry, double rYaw,
       const double wx = rx + c*gx - s*gy;
       const double wy = ry + s*gx + c*gy;
 
-      float hraw, hbound; uint8_t occ;
-      sampleBilinearRawBoundUnlocked(wx, wy, hraw, hbound, occ);
+      float hraw, hfill;
+      sampleBilinear(wx, wy, hraw, hfill);
       raw_row[j] = hraw;
-
-      float hfill;
-      sampleBilinearFilledUnlocked(wx, wy, hfill);
       filled_row[j] = hfill;
     }
   }

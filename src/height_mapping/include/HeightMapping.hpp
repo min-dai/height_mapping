@@ -67,11 +67,6 @@ private:
 
   void shiftRingBuffer_(int si, int sj);
 
-  // Bilinear sampling of both raw height and boundary-connected height
-  void sampleBilinearBoth_(double wx, double wy,
-                           float& h_raw, float& h_bound,
-                           uint8_t& occ_val, uint8_t& edge_touch) const;
-
 
   // --- NEW: per-cell z-histogram aggregator (robot-relative) ---
   struct ZAgg {

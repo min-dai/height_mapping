@@ -14,12 +14,15 @@ int main() {
   height_mapping::HeightMap map(P);
 
   // Define lists of robot positions
-  // std::vector<float> robot_x_list = {0.0f, 5.0f, 10.0f, 15.0f, 20.0f};
-  std::vector<float> robot_x_list = {0.0f, 0.2f, 0.4f, 0.6f, 2.2f};
   // std::vector<float> robot_x_list = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-  std::vector<float> robot_y_list = {0.0f, 0.0, 0.0, 0.0, 0.0};
-  std::vector<float> robot_z_list = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-  std::vector<float> robot_yaw_list = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+  // std::vector<float> robot_y_list = {0.0f, 0.0, 0.0, 0.0, 0.0};
+  // std::vector<float> robot_z_list = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+  // std::vector<float> robot_yaw_list = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+  std::vector<float> robot_x_list = {0.0f, 0.2f, 0.4f, 0.6f, 2.2f};
+  std::vector<float> robot_y_list = {0.0f, -0.3, -0.6, -0.9, -1.2};
+  std::vector<float> robot_z_list = {0.0f, 0.5f, 1.0f, 0.3f, -0.7f};
+  std::vector<float> robot_yaw_list = {0.0f, 0.2f, 0.6f, 1.2f, 2.0f};
 
   // Loop through each robot position
   for (int pos_idx = 0; pos_idx < 5; ++pos_idx) {

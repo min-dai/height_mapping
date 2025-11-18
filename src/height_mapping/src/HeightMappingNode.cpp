@@ -42,6 +42,7 @@ public:
     P.Wq          = declare_parameter<int>("sub_width", 200);
     P.Hq          = declare_parameter<int>("sub_height", 200);
     P.res_q       = declare_parameter<double>("sub_resolution", P.res);
+    P.subgrid_bilinear_interp = declare_parameter<bool>("subgrid_bilinear_interp", true);
 
     publish_rate_ = declare_parameter<double>("publish_rate_hz", 10.0);
     use_voxel_ds_ = declare_parameter<bool>("voxel_downsample", false);
@@ -51,8 +52,11 @@ public:
     mapper_ = std::make_shared<height_mapping::HeightMap>(P);
 
     // pubs/subs
-    pub_raw_  = create_publisher<sensor_msgs::msg::PointCloud2>("height_grid/sub_raw", 1);
-    pub_fill_ = create_publisher<sensor_msgs::msg::PointCloud2>("height_grid/sub_filled", 1);
+    pub_raw_  = create_publisher<sensor_msgs::msg::PointCloud2>("height_grid/pub_raw", 1);
+    pub_fill_ = create_publisher<sensor_msgs::msg::PointCloud2>("height_grid/pub_filled", 1);
+    pub_big_ = create_publisher<sensor_msgs::msg::PointCloud2>("height_grid/pub_big", 1);
+    enable_pub_big_ = declare_parameter<bool>("enable_pub_big", false);
+    enable_pub_raw_ = declare_parameter<bool>("enable_pub_raw", true);
 
     sub_cloud_ = create_subscription<sensor_msgs::msg::PointCloud2>(
       topic_cloud_, rclcpp::SensorDataQoS(),
@@ -72,6 +76,134 @@ public:
   }
 
 private:
+  sensor_msgs::msg::PointCloud2::SharedPtr createPointCloud(
+      const cv::Mat& height_mat,
+      const height_mapping::SubgridMeta& meta,
+      const rclcpp::Time& stamp) {
+    auto cloud = std::make_shared<sensor_msgs::msg::PointCloud2>();
+    cloud->header.stamp = stamp;
+    cloud->header.frame_id = map_frame_;
+
+    // Set up point cloud structure: XYZ + RGB
+    cloud->width = meta.width * meta.height;
+    cloud->height = 1;
+    cloud->is_dense = false;
+
+    // Point cloud fields: x, y, z, rgb
+    cloud->fields.resize(4);
+    cloud->fields[0].name = "x";
+    cloud->fields[0].offset = 0;
+    cloud->fields[0].datatype = sensor_msgs::msg::PointField::FLOAT32;
+    cloud->fields[0].count = 1;
+
+    cloud->fields[1].name = "y";
+    cloud->fields[1].offset = 4;
+    cloud->fields[1].datatype = sensor_msgs::msg::PointField::FLOAT32;
+    cloud->fields[1].count = 1;
+
+    cloud->fields[2].name = "z";
+    cloud->fields[2].offset = 8;
+    cloud->fields[2].datatype = sensor_msgs::msg::PointField::FLOAT32;
+    cloud->fields[2].count = 1;
+
+    cloud->fields[3].name = "rgb";
+    cloud->fields[3].offset = 12;
+    cloud->fields[3].datatype = sensor_msgs::msg::PointField::UINT32;
+    cloud->fields[3].count = 1;
+
+    cloud->point_step = 16; // 4 floats * 4 bytes
+    cloud->row_step = cloud->point_step * cloud->width;
+    cloud->data.resize(cloud->row_step);
+
+    // First pass: find min/max heights in valid data
+    float min_height = std::numeric_limits<float>::infinity();
+    float max_height_data = -std::numeric_limits<float>::infinity();
+
+    for (int i = 0; i < meta.height; ++i) {
+      const float* row = height_mat.ptr<float>(i);
+      for (int j = 0; j < meta.width; ++j) {
+        float height = row[j];
+        if (!std::isnan(height) && !std::isinf(height)) {
+          min_height = std::min(min_height, height);
+          max_height_data = std::max(max_height_data, height);
+        }
+      }
+    }
+
+    // Handle case where no valid data exists
+    if (std::isinf(min_height)) {
+      min_height = 0.0f;
+      max_height_data = 1.0f;
+    }
+
+    // Avoid division by zero
+    float height_range = max_height_data - min_height;
+    if (height_range < 1e-6f) {
+      height_range = 1.0f;
+    }
+
+    // Convert height map to 3D points with height-based coloring
+    int point_idx = 0;
+    uint8_t* data_ptr = cloud->data.data();
+
+    for (int i = 0; i < meta.height; ++i) {
+      const float* row = height_mat.ptr<float>(i);
+      for (int j = 0; j < meta.width; ++j) {
+        float height = row[j];
+
+        if (std::isnan(height) || std::isinf(height)) {
+          // Skip invalid points
+          continue;
+        }
+
+        // World coordinates for this grid cell - use same transform as generateSubgrid
+        const double halfW = 0.5 * meta.width * meta.resolution;
+        const double halfH = 0.5 * meta.height * meta.resolution;
+        const double gx = (static_cast<double>(j) + 0.5) * meta.resolution - halfW;
+        const double gy = (static_cast<double>(i) + 0.5) * meta.resolution - halfH;
+
+        // Apply rotation (same as generateSubgrid)
+        const double c = std::cos(meta.yaw), s = std::sin(meta.yaw);
+        // Extract robot position from meta.origin (which is bottom-left corner)
+        const double rx = meta.origin_x - c*(-halfW) + s*(-halfH);
+        const double ry = meta.origin_y - s*(-halfW) - c*(-halfH);
+
+        double world_x = rx + c*gx - s*gy;
+        double world_y = ry + s*gx + c*gy;
+
+        // Get pointer to this point's data
+        uint8_t* point_data = data_ptr + point_idx * cloud->point_step;
+        float* xyz_ptr = reinterpret_cast<float*>(point_data);
+        uint32_t* rgb_ptr = reinterpret_cast<uint32_t*>(point_data + 12);
+
+        // Set XYZ
+        xyz_ptr[0] = static_cast<float>(world_x);
+        xyz_ptr[1] = static_cast<float>(world_y);
+        xyz_ptr[2] = height;
+
+        // Height-based coloring using actual data range: blue (low) to red (high)
+        float normalized_height = (height - min_height) / height_range;
+        normalized_height = std::max(0.0f, std::min(1.0f, normalized_height));
+
+        uint8_t r = static_cast<uint8_t>(normalized_height * 255);
+        uint8_t g = static_cast<uint8_t>((1.0f - normalized_height) * normalized_height * 4 * 255);
+        uint8_t b = static_cast<uint8_t>((1.0f - normalized_height) * 255);
+        uint32_t rgb = (static_cast<uint32_t>(r) << 16) |
+                      (static_cast<uint32_t>(g) << 8) |
+                      static_cast<uint32_t>(b);
+
+        *rgb_ptr = rgb;
+        point_idx++;
+      }
+    }
+
+    // Update actual point count
+    cloud->width = point_idx;
+    cloud->data.resize(point_idx * cloud->point_step);
+
+    return cloud;
+  }
+
   bool getRobotPose(const rclcpp::Time& t, double& x, double& y, double& z, double& yaw) {
     try {
       RCLCPP_DEBUG(get_logger(), "Attempting TF lookup: %s -> %s", map_frame_.c_str(), base_frame_.c_str());
@@ -212,151 +344,41 @@ private:
     }
 
     RCLCPP_DEBUG(get_logger(), "Generating subgrid at pose (%.2f, %.2f, %.2f, %.2f)", rx, ry, rz, rYaw);
-    cv::Mat sub_raw, sub_filled;
+    cv::Mat pub_raw_map, pub_filled_map;
     height_mapping::SubgridMeta meta;
-    mapper_->generateSubgrid(rx, ry, rYaw, sub_raw, sub_filled, meta);
+    mapper_->generateSubgrid(rx, ry, rYaw, pub_raw_map, pub_filled_map, meta);
     RCLCPP_DEBUG(get_logger(), "Subgrid generated: %dx%d", meta.width, meta.height);
 
     // Publish height point clouds
     auto stamp = now();
+
+    // Publish subgrid point clouds
+    pub_fill_->publish(*createPointCloud(pub_filled_map, meta, stamp));
+    if (enable_pub_raw_) {
+      pub_raw_->publish(*createPointCloud(pub_raw_map, meta, stamp));
+    }
     
-    // Convert height maps to point clouds
-    auto createPointCloud = [&](const cv::Mat& height_mat) {
-      auto cloud = std::make_shared<sensor_msgs::msg::PointCloud2>();
-      cloud->header.stamp = stamp;
-      cloud->header.frame_id = map_frame_;
-      
-      // Set up point cloud structure: XYZ + RGB
-      cloud->width = meta.width * meta.height;
-      cloud->height = 1;
-      cloud->is_dense = false;
-      
-      // Point cloud fields: x, y, z, rgb
-      cloud->fields.resize(4);
-      cloud->fields[0].name = "x";
-      cloud->fields[0].offset = 0;
-      cloud->fields[0].datatype = sensor_msgs::msg::PointField::FLOAT32;
-      cloud->fields[0].count = 1;
-      
-      cloud->fields[1].name = "y"; 
-      cloud->fields[1].offset = 4;
-      cloud->fields[1].datatype = sensor_msgs::msg::PointField::FLOAT32;
-      cloud->fields[1].count = 1;
-      
-      cloud->fields[2].name = "z";
-      cloud->fields[2].offset = 8; 
-      cloud->fields[2].datatype = sensor_msgs::msg::PointField::FLOAT32;
-      cloud->fields[2].count = 1;
-      
-      cloud->fields[3].name = "rgb";
-      cloud->fields[3].offset = 12;
-      cloud->fields[3].datatype = sensor_msgs::msg::PointField::UINT32;
-      cloud->fields[3].count = 1;
-      
-      cloud->point_step = 16; // 4 floats * 4 bytes
-      cloud->row_step = cloud->point_step * cloud->width;
-      cloud->data.resize(cloud->row_step);
-      
-      // First pass: find min/max heights in valid data
-      float min_height = std::numeric_limits<float>::infinity();
-      float max_height_data = -std::numeric_limits<float>::infinity();
-      
-      for (int i = 0; i < meta.height; ++i) {
-        const float* row = height_mat.ptr<float>(i);
-        for (int j = 0; j < meta.width; ++j) {
-          float height = row[j];
-          if (!std::isnan(height) && !std::isinf(height)) {
-            min_height = std::min(min_height, height);
-            max_height_data = std::max(max_height_data, height);
-          }
-        }
-      }
-      
-      // Handle case where no valid data exists
-      if (std::isinf(min_height)) {
-        min_height = 0.0f;
-        max_height_data = 1.0f;
-      }
-      
-      // Avoid division by zero
-      float height_range = max_height_data - min_height;
-      if (height_range < 1e-6f) {
-        height_range = 1.0f;
-      }
-      
-      // Convert height map to 3D points with height-based coloring
-      int point_idx = 0;
-      float* data_ptr = reinterpret_cast<float*>(cloud->data.data());
-      uint32_t* rgb_ptr = reinterpret_cast<uint32_t*>(cloud->data.data() + 12);
-      
-      for (int i = 0; i < meta.height; ++i) {
-        const float* row = height_mat.ptr<float>(i);
-        for (int j = 0; j < meta.width; ++j) {
-          float height = row[j];
-          
-          if (std::isnan(height) || std::isinf(height)) {
-            // Skip invalid points
-            continue;
-          }
-          
-          // World coordinates for this grid cell - use same transform as generateSubgrid
-          const double halfW = 0.5 * meta.width * meta.resolution;
-          const double halfH = 0.5 * meta.height * meta.resolution;
-          const double gx = (static_cast<double>(j) + 0.5) * meta.resolution - halfW;
-          const double gy = (static_cast<double>(i) + 0.5) * meta.resolution - halfH;
-          
-          // Apply rotation (same as generateSubgrid)
-          const double c = std::cos(meta.yaw), s = std::sin(meta.yaw);
-          // Extract robot position from meta.origin (which is bottom-left corner)
-          const double rx = meta.origin_x - c*(-halfW) + s*(-halfH);
-          const double ry = meta.origin_y - s*(-halfW) - c*(-halfH);
-          
-          double world_x = rx + c*gx - s*gy;
-          double world_y = ry + s*gx + c*gy;
-          
-          // Set XYZ
-          data_ptr[point_idx * 4 + 0] = static_cast<float>(world_x);
-          data_ptr[point_idx * 4 + 1] = static_cast<float>(world_y); 
-          data_ptr[point_idx * 4 + 2] = height;
-          
-          // Height-based coloring using actual data range: blue (low) to red (high)
-          float normalized_height = (height - min_height) / height_range;
-          normalized_height = std::max(0.0f, std::min(1.0f, normalized_height));
-          
-          uint8_t r = static_cast<uint8_t>(normalized_height * 255);
-          uint8_t g = static_cast<uint8_t>((1.0f - normalized_height) * normalized_height * 4 * 255);
-          uint8_t b = static_cast<uint8_t>((1.0f - normalized_height) * 255);
-          uint32_t rgb = (static_cast<uint32_t>(r) << 16) | 
-                        (static_cast<uint32_t>(g) << 8) | 
-                        static_cast<uint32_t>(b);
-          
-          rgb_ptr[point_idx] = rgb;
-          point_idx++;
-        }
-      }
-      
-      // Update actual point count
-      cloud->width = point_idx;
-      cloud->data.resize(point_idx * cloud->point_step);
-      
-      return cloud;
-    };
-    
-    pub_raw_->publish(*createPointCloud(sub_raw));
-    pub_fill_->publish(*createPointCloud(sub_filled));
+    // Publish big map point cloud with its own metadata
+    if (enable_pub_big_) {
+      cv::Mat pub_big_map, tmp1, tmp2;
+      height_mapping::SubgridMeta big_meta = mapper_->getBigMapMeta();
+      mapper_->snapshotBig(pub_big_map, tmp1, tmp2);
+      pub_big_->publish(*createPointCloud(pub_big_map, big_meta, stamp));
+    }
     RCLCPP_DEBUG(get_logger(), "Published height maps and metadata");
   }
 
 private:
   // ROS
   std::string map_frame_, base_frame_, topic_cloud_, lidar_frame_;
+  bool enable_pub_big_, enable_pub_raw_;
   double publish_rate_{10.0};
   bool use_voxel_ds_{false}, transform_cloud_if_needed_{true};
   double voxel_leaf_{0.05};
   double max_height_{2.0};
 
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_cloud_;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_raw_, pub_fill_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_raw_, pub_fill_, pub_big_;
   rclcpp::TimerBase::SharedPtr timer_;
 
   tf2_ros::Buffer tf_buffer_;

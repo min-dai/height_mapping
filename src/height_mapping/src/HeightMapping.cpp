@@ -127,7 +127,6 @@ void HeightMap::reset() {
   hconn_b_.assign(Nb, static_cast<float>(max_h_ + robot_z_));
   for (size_t i = 0; i < Nb; ++i) zaggInit_(zagg_b_[i]);
 
-  temp_min_.assign(Nb, std::numeric_limits<float>::infinity());
   temp_cnt_.assign(Nb, 0);
   start_i_ = start_j_ = 0;
   origin_x_ = origin_y_ = 0.0;
@@ -242,23 +241,35 @@ inline void HeightMap::zaggInsert_(ZAgg& agg, float z) {
   if (bin < 0 || bin >= B_) return;   // z is outside current histogram range
 
   uint8_t& count = agg.bins[bin];     // Increment the appropriate count, if bin not saturated
+  const uint8_t old_count = count;
   if (count < 255) ++count;
-  
+
   auto bin_present = [&](int idx)->bool {
     return (idx >= 0 && idx < B_) && (agg.bins[idx] >= bin_min_count_);
   };  // Check if a bin is occupied, i.e. has more than bin_min_count_ points
 
-  if (agg.min_bin == B_ || bin < agg.min_bin) {  // The bin is lower than existing min, update the min_bin
-    agg.min_bin = bin;
+  // Only update min_bin if this bin just became valid AND is lower than current min
+  bool need_update = false;
+  if (old_count < bin_min_count_ && count >= bin_min_count_) {
+    // This bin just reached the threshold
+    if (agg.min_bin == B_ || bin < agg.min_bin) {
+      // First valid bin, or lower than current min
+      agg.min_bin = bin;
+      need_update = true;
+    }
+  }
+
+  // Also update if we're extending the delta-connected region upward
+  if (!need_update && agg.top_conn_from_min >= 0 &&
+      bin <= agg.top_conn_from_min + max_empty_bins_ &&
+      old_count < bin_min_count_ && count >= bin_min_count_) {
+    need_update = true;
+  }
+
+  // Recompute delta-connected top if needed
+  if (need_update && agg.min_bin < B_) {
     int top = agg.min_bin, gaps = 0;
     for (int t = agg.min_bin + 1; t < B_; ++t) {
-      if (bin_present(t)) { top = t; gaps = 0; }
-      else if (++gaps > max_empty_bins_) break;
-    }
-    agg.top_conn_from_min = top;
-  } else if (agg.top_conn_from_min >= 0 && bin <= agg.top_conn_from_min + max_empty_bins_) {
-    int top = agg.top_conn_from_min, gaps = 0;
-    for (int t = top + 1; t < B_; ++t) {
       if (bin_present(t)) { top = t; gaps = 0; }
       else if (++gaps > max_empty_bins_) break;
     }
@@ -547,12 +558,10 @@ void HeightMap::ingestPoints(const std::vector<Point3f>& pts) {
   PROFILE_SAVE_PNG(bh, "pre_ingest_h" + run_suffix + ".png");
   PROFILE_SAVE_PNG(bk, "pre_ingest_known" + run_suffix + ".png");
 
-  // Reset per-scan min buckets
-  const size_t Nb = static_cast<size_t>(Wb_) * static_cast<size_t>(Hb_);
-  std::fill(temp_min_.begin(), temp_min_.end(), std::numeric_limits<float>::infinity());
+  // Reset per-scan count (no longer tracking temp_min, using zagg instead)
   std::fill(temp_cnt_.begin(), temp_cnt_.end(), 0);
 
-  // Bin points: update temp_min_ and z-histograms together
+  // Bin points: update z-histograms (temp_min/cnt no longer needed)
   for (const auto& p : pts) {
     if (p.z < robot_z_ + params_.z_min || p.z > robot_z_ + params_.z_max) continue;
     const int j = static_cast<int>(std::floor((p.x - origin_x_) / res_));
@@ -560,8 +569,7 @@ void HeightMap::ingestPoints(const std::vector<Point3f>& pts) {
     if (i < 0 || i >= Hb_ || j < 0 || j >= Wb_) continue;
     const size_t id = idxRB(i, j);
 
-    float &cell_min = temp_min_[id];
-    if (p.z < cell_min) cell_min = p.z;
+    // Track which cells received points this scan
     ++temp_cnt_[id];
 
     // Update per-cell histogram (no lock; ingestPoints is single-threaded)
@@ -570,26 +578,30 @@ void HeightMap::ingestPoints(const std::vector<Point3f>& pts) {
     hconn_b_[id] = agg.h_conn_max; // keep cache fresh
   }
 
-  // Fuse per-scan min into height & masks (lock during write)
+  // Update height field directly from zagg histograms
   const float tnow = 0.0f;
   {
     for (int i = 0; i < Hb_; ++i) {
       for (int j = 0; j < Wb_; ++j) {
         const size_t id = idxRB(i,j);
         const int cnt = temp_cnt_[id];
-        if (cnt == 0) continue;
+        if (cnt == 0) continue;  // No points in this cell this scan
 
-        const float zmin_scan = temp_min_[id];
+        const ZAgg& agg = zagg_b_[id];
         float   &h = height_b_[id];
         uint8_t &k = known_b_[id];
         uint8_t &o = occ_b_[id];
 
-        if (!k) { h = zmin_scan; k = 1; o = 0; stamp_b_[id] = tnow; continue; }
-        if (zmin_scan < h - static_cast<float>(drop_thresh_) && cnt >= min_support_) {
-          h = zmin_scan; o = 0; stamp_b_[id] = tnow;
-        } else if (zmin_scan < h) {
-          h = 0.9f*h + 0.1f*zmin_scan; o = 0; stamp_b_[id] = tnow;
+        // Use zagg's minimum height (which has temporal consensus built-in)
+        // zagg.h_min is only valid if min_bin has >= bin_min_count_ points
+        if (agg.min_bin < B_) {
+          // Valid minimum found in histogram
+          h = agg.h_min;
+          k = 1;
+          o = 0;
+          stamp_b_[id] = tnow;
         }
+        // If min_bin == B_, no bin has enough points yet, so don't update height
       }
     }
 
@@ -660,6 +672,30 @@ void HeightMap::generateSubgrid(double rx, double ry, double rYaw,
     return static_cast<size_t>(ri) * Wb + static_cast<size_t>(rj);
   };
 
+  auto sampleNearest = [&](double wx, double wy, float& h_raw, float& h_fill) {
+    const double uf = (wx - origin_x) / res;
+    const double vf = (wy - origin_y) / res;
+
+    const int j = static_cast<int>(std::round(uf));
+    const int i = static_cast<int>(std::round(vf));
+
+    if (i < 0 || i >= Hb || j < 0 || j >= Wb) {
+      h_raw = static_cast<float>(max_h);
+      h_fill = static_cast<float>(max_h);
+      return;
+    }
+
+    const size_t id = idxRB_local(i, j);
+
+    if (snap_known[id]) {
+      h_raw = snap_height[id];
+      h_fill = snap_filled[id];
+    } else {
+      h_raw = static_cast<float>(max_h);
+      h_fill = snap_filled[id];  // Filled grid may have interpolated values
+    }
+  };
+
   auto sampleBilinear = [&](double wx, double wy, float& h_raw, float& h_fill) {
     const double uf = (wx - origin_x) / res;
     const double vf = (wy - origin_y) / res;
@@ -704,7 +740,7 @@ void HeightMap::generateSubgrid(double rx, double ry, double rYaw,
       // Use the raw heights here (observed corners)
       const float h00 = snap_height[id00], h10 = snap_height[id10];
       const float h01 = snap_height[id01], h11 = snap_height[id11];
-      
+
       h_raw = static_cast<float>((kw00*h00 + kw10*h10 + kw01*h01 + kw11*h11) / kwsum);
     } else {
       h_raw = static_cast<float>(max_h);
@@ -721,6 +757,7 @@ void HeightMap::generateSubgrid(double rx, double ry, double rYaw,
   // ---- Now do the usual subgrid sampling with NO locks
   const int Wq = params_.Wq, Hq = params_.Hq;
   const double rq = params_.res_q;
+  const bool use_bilinear = params_.subgrid_bilinear_interp;
 
   sub_raw.create(Hq, Wq, CV_32FC1);
   sub_filled.create(Hq, Wq, CV_32FC1);
@@ -740,7 +777,11 @@ void HeightMap::generateSubgrid(double rx, double ry, double rYaw,
       const double wy = ry + s*gx + c*gy;
 
       float hraw, hfill;
-      sampleBilinear(wx, wy, hraw, hfill);
+      if (use_bilinear) {
+        sampleBilinear(wx, wy, hraw, hfill);
+      } else {
+        sampleNearest(wx, wy, hraw, hfill);
+      }
       raw_row[j] = hraw;
       filled_row[j] = hfill;
     }
@@ -775,6 +816,22 @@ void HeightMap::snapshotBig(cv::Mat& outHeight, cv::Mat& outKnown, cv::Mat& outO
       orw[j]= occ_b_[id];
     }
   }
+}
+
+SubgridMeta HeightMap::getBigMapMeta() const {
+  std::lock_guard<std::mutex> lk(m_);
+  SubgridMeta meta;
+  meta.width = Wb_;
+  meta.height = Hb_;
+  meta.resolution = static_cast<float>(res_);
+  meta.yaw = 0.0;  // Big map is always axis-aligned (no rotation)
+
+  // The origin is at the bottom-left corner of the big map
+  // Since the big map is centered on origin_x_, origin_y_, we need to compute bottom-left
+  meta.origin_x = origin_x_;
+  meta.origin_y = origin_y_;
+
+  return meta;
 }
 
 } // namespace height_mapping

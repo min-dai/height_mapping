@@ -2,8 +2,8 @@
 
 from launch_ros.actions import Node
 from launch import LaunchDescription
-from launch.substitutions import PathJoinSubstitution
 from launch_ros.substitutions import FindPackageShare
+from launch.substitutions import PathJoinSubstitution
 from launch.actions import IncludeLaunchDescription, LogInfo
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 
@@ -23,34 +23,21 @@ def generate_launch_description():
         }.items()
     )
 
-    # Height mapping node with parameters
+    # Height mapping node with parameters from YAML file
+    config_file = PathJoinSubstitution([
+        FindPackageShare('height_mapping'),
+        'config',
+        'hieght_mapping.yaml'
+    ])
+
     height_mapping_node = Node(
         package='height_mapping',
         executable='height_mapping_node',
-        name='height_mapping_node',
-        parameters=[{
-            'use_sim_time': True,
-            'map_frame': 'odom',
-            'base_frame': 'body', 
-            'topic_cloud': '/cloud_registered',
-            'livox_frame': '',
-            'resolution': 0.2,
-            'big_width': 50,
-            'big_height': 50,
-            'max_height': 2.0,
-            'z_min': -20.0,
-            'z_max': 20.0,
-            'drop_thresh': 0.07,
-            'min_support': 2,
-            'shift_thresh_m': 0.5,
-            'sub_width': 11,
-            'sub_height': 11,
-            'sub_resolution': 0.1,
-            'publish_rate_hz': 10.0,
-            'voxel_downsample': False,
-            'voxel_leaf': 0.05,
-            'transform_cloud': True
-        }],
+        name='height_map_node',  # Must match the node name in YAML file
+        parameters=[
+            config_file,
+            {'use_sim_time': True}  # Override use_sim_time if needed
+        ],
         output='screen',
         respawn=True,
         respawn_delay=2.0

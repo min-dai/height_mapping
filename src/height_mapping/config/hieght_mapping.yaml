@@ -1,24 +1,28 @@
 height_map_node:
   ros__parameters:
-    map_frame: map
-    base_frame: base_link
+    map_frame: odom
+    base_frame: body
     topic_cloud: /cloud_registered
-    resolution: 0.025
-    big_width: 800
-    big_height: 800
-    shift_thresh_m: 0.5
+    resolution: 0.2
+    big_width: 200
+    big_height: 200
+    shift_thresh_m: 2.5
     max_height: 2.0
     z_min: -4.0
     z_max:  4.0
     drop_thresh: 0.25
     min_support: 2
 
-    sub_width: 400
-    sub_height: 400
-    sub_resolution: 0.025
+    sub_width: 101
+    sub_height: 101
+    sub_resolution: 0.05
+    subgrid_bilinear_interp: false
     publish_rate_hz: 10.0
 
     occluded_fraction_threshold: 0.5
     voxel_downsample: false
     voxel_leaf: 0.05
     transform_cloud: true
+
+    enable_pub_big: true
+    enable_pub_raw: false

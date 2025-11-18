@@ -32,8 +32,9 @@ struct Params {
   // Subgrid
   int    Wq = 200, Hq = 200;
   double res_q = 0.05;
+  bool   subgrid_bilinear_interp = true; // Use bilinear interpolation (vs nearest-neighbor)
 
-  // --- histogram / connectivity settings ---
+  // --- NEW: histogram / connectivity settings ---
   double z_hist_bin = 0.02;      // bin size [m], choose <= δ/2
   double z_connect_delta = 0.05; // δ: tolerate gaps up to this [m]
   int    z_bin_min_count = 2;    // min bin occupancy to count as "present"
@@ -57,6 +58,9 @@ public:
 
   void snapshotBig(cv::Mat& H, cv::Mat& K, cv::Mat& O) const;
   bool haveOrigin() const { return have_origin_; }
+
+  // Get big map metadata for point cloud conversion
+  SubgridMeta getBigMapMeta() const;
 
 private:
   inline size_t idxRB(int i, int j) const noexcept {
@@ -122,8 +126,7 @@ private:
   std::vector<ZAgg>  zagg_b_;   // size Wb*Hb
   std::vector<float> hconn_b_;  // cached h_conn_max per cell (meters)
 
-  // Per-scan buckets (for min fusion)
-  std::vector<float> temp_min_;
+  // Per-scan buckets (track which cells got points this scan)
   std::vector<int>   temp_cnt_;
 
   // New members (private)

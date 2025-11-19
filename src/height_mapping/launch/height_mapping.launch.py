@@ -81,11 +81,25 @@ def generate_launch_description():
         msg="Launching FAST-LIO and Height Mapping pipeline..."
     )
 
+    static_tf_body_pelvis = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="static_tf_body_pelvis",
+        arguments=[
+            # x y z roll pitch yaw
+            "0.01911", "0.0", "0.47580",   # x y z
+            "0.0", "0.0401426", "0.0",     # roll pitch yaw (rad)
+            "body",
+            "pelvis",
+        ],
+    )
+
     return LaunchDescription([
         use_sim_time_arg,
         rviz_arg,
         log_info,
         log_rviz,
+        static_tf_body_pelvis,
         fast_lio_launch,
         height_mapping_node,
         rviz_node

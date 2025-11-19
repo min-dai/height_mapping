@@ -18,7 +18,7 @@ Additionally, the installed livox drivers need to be updated with the proper ip 
 ```TODO```
 
 Which comes pre-set on the docker image. If using a different lidar, the IP addresses of the host and the lidar need to be set appropriately. 
-Then, build docker image. Using the installed terminal aliases, run `livox`, which performs:
+Then, build docker image. To install terminal aliases, run `source scripts/setup_aliases.bash`. Using the installed terminal aliases, run `livox`, which performs:
 
 ```source /opt/ros/humble/setup.bash && source /ws_livox/install/setup.bash```
 

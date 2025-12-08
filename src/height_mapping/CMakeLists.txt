@@ -29,6 +29,8 @@ target_link_libraries(height_mapping_core PUBLIC ${OpenCV_LIBS})
 # ROS 2 node
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(Eigen3 REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
@@ -92,13 +94,14 @@ if(BUILD_MUJOCO_SPOOF_NODE)
   endif()
 
   add_executable(height_mapping_spoof_node src/HeightMappingSpoofNode.cpp)
+  add_executable(height_mapping_spoof_mocap_node src/HeightMappingSpoofNodeMoCap.cpp)
 
+  # Spoof node
   target_include_directories(height_mapping_spoof_node PUBLIC
     include
     ${PCL_INCLUDE_DIRS}
     ${MUJOCO_INCLUDE_DIR}
   )
-
   ament_target_dependencies(height_mapping_spoof_node
     rclcpp
     sensor_msgs
@@ -109,15 +112,40 @@ if(BUILD_MUJOCO_SPOOF_NODE)
     pcl_conversions
     ament_index_cpp
   )
-
   target_link_libraries(height_mapping_spoof_node
     height_mapping_core
     ${OpenCV_LIBS}
     ${PCL_LIBRARIES}
     ${MUJOCO_LIBRARY}
   )
-
   install(TARGETS height_mapping_spoof_node DESTINATION lib/${PROJECT_NAME})
+
+  # MoCap spoof node
+  target_include_directories(height_mapping_spoof_mocap_node PUBLIC
+    include
+    ${PCL_INCLUDE_DIRS}
+    ${MUJOCO_INCLUDE_DIR}
+    ${EIGEN3_INCLUDE_DIR}
+  )
+  ament_target_dependencies(height_mapping_spoof_mocap_node
+    rclcpp
+    sensor_msgs
+    geometry_msgs
+    nav_msgs
+    tf2
+    tf2_ros
+    cv_bridge
+    pcl_conversions
+    ament_index_cpp
+  )
+  target_link_libraries(height_mapping_spoof_mocap_node
+    height_mapping_core
+    ${OpenCV_LIBS}
+    ${PCL_LIBRARIES}
+    ${MUJOCO_LIBRARY}
+    Eigen3::Eigen
+  )
+  install(TARGETS height_mapping_spoof_mocap_node DESTINATION lib/${PROJECT_NAME})
 endif()
 
 install(TARGETS height_mapping_core DESTINATION lib)

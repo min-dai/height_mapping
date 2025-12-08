@@ -81,14 +81,26 @@ def generate_launch_description():
         msg="Launching FAST-LIO and Height Spoofing pipeline..."
     )
 
+    # static_tf_body_pelvis = Node(
+    #     package="tf2_ros",
+    #     executable="static_transform_publisher",
+    #     name="static_tf_body_pelvis",
+    #     arguments=[
+    #         # x y z roll pitch yaw
+    #         "0.01911", "0.0", "0.47580",   # x y z
+    #         "0.0", "0.0401426", "0.0",     # roll pitch yaw (rad)
+    #         "body",
+    #         "pelvis",
+    #     ],
+    # )
     static_tf_body_pelvis = Node(
         package="tf2_ros",
         executable="static_transform_publisher",
         name="static_tf_body_pelvis",
         arguments=[
             # x y z roll pitch yaw
-            "0.01911", "0.0", "0.47580",   # x y z
-            "0.0", "0.0401426", "0.0",     # roll pitch yaw (rad)
+            "0.0", "-0.1659", "-0.0628",   # x y z
+             "1.5708",  "-1.4137", "0.0",
             "body",
             "pelvis",
         ],
@@ -100,7 +112,7 @@ def generate_launch_description():
         log_info,
         log_rviz,
         static_tf_body_pelvis,
+        rviz_node,
         fast_lio_launch,
-        height_spoof_node,
-        rviz_node
+        height_spoof_node
     ])

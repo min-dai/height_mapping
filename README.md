@@ -53,3 +53,27 @@ Similarly, to run the heightmap spoofing code, run:
 
 This will load the `.xml` file in `rsc` folder into Mujoco to use for raycasting.
 
+## Odom via Motion Capture
+
+To use motion capture as the source of odometry, ensure the following
+ - Networking Setup
+   - The host computer (running Motive) connects to the Motive Ethernet box via Ethernet (likely over the IP address 169.245.255). This network should not be used for NatNet streaming.
+   - Connect the host computer and client computer (running ROS2) to a different local network, i.e. 192.168.1.1 for the client, and 192.168.1.2 for the host (configure the IPV4 settings manually, with network mask 255.255.255.0).
+   - Ensure both computers can ping each other over this local network. If not, check firewall settings on the host computer.
+ - The motive streaming client has the following settings:
+   - NatNet: enabled
+   - Local Interface: 192.168.1.2 (or appropriate IP for the host computer, running motive)
+   - Transmission Type: Multicast
+   - Rigid Bodies: enabled
+   - Up Axis: Z-Axis
+   - VRPN: disabled
+ - Ensure the NatNet ROS2 client is installed from [here](https://github.com/L2S-lab/natnet_ros2), and launch the natnet client with 
+   ```ros2 launch natnet_ros2 gui_natnet_ros2.launch.py``` In the resulting GUI, set:
+   - ROS Domain ID: 2 (or appropriate ROS domain ID)
+   - Server IP: 192.168.1.2 (or appropriate IP for the host computer, running motive)
+   - Client IP: 192.168.1.1 (or appropriate IP for the client machine)
+   - publish rigid body: checked (true)
+   - World frame: odom
+
+Upon clicking 'Start', the NatNet client should begin streaming motion capture data to the ROS2 network.
+It will publish to the topic `/g1/pose` as a `geometry_msgs/msg/PoseStamped` message (assuming the rigid body in Motive is named 'g1').

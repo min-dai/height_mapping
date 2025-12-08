@@ -43,16 +43,16 @@ def generate_launch_description():
         }.items()
     )
 
-    # Height mapping node with parameters from YAML file
+    # Height mapping spoof node with parameters from dedicated config file
     config_file = PathJoinSubstitution([
         FindPackageShare('height_mapping'),
         'config',
-        'height_mapping.yaml'
+        'height_spoofing.yaml'
     ])
 
-    height_mapping_node = Node(
+    height_spoof_node = Node(
         package='height_mapping',
-        executable='height_mapping_node',
+        executable='height_mapping_spoof_mocap_node',
         name='height_map_node',  # Must match the node name in YAML file
         parameters=[
             config_file,
@@ -66,7 +66,7 @@ def generate_launch_description():
     top_rviz_config = PathJoinSubstitution([
         FindPackageShare('height_mapping'),
         'rviz',
-        'heightmap.rviz'
+        'heightspoof.rviz'
     ])
 
     rviz_node = Node(
@@ -78,7 +78,7 @@ def generate_launch_description():
 
     # Log info about what's being launched
     log_info = LogInfo(
-        msg="Launching FAST-LIO and Height Mapping pipeline..."
+        msg="Launching FAST-LIO and Height Spoofing MoCappipeline..."
     )
 
     # static_tf_body_pelvis = Node(
@@ -87,7 +87,7 @@ def generate_launch_description():
     #     name="static_tf_body_pelvis",
     #     arguments=[
     #         # x y z roll pitch yaw
-    #         "0.01911", "0.0", "0.47580",   # x y z in z down coordinate
+    #         "0.01911", "0.0", "0.47580",   # x y z
     #         "0.0", "0.0401426", "0.0",     # roll pitch yaw (rad)
     #         "body",
     #         "pelvis",
@@ -100,7 +100,7 @@ def generate_launch_description():
         arguments=[
             # x y z roll pitch yaw
             "0.0", "-0.1659", "-0.0628",   # x y z
-             "1.5708",  "-1.4137", "0.0", 
+             "1.5708",  "-1.4137", "0.0",
             "body",
             "pelvis",
         ],
@@ -112,7 +112,7 @@ def generate_launch_description():
         log_info,
         log_rviz,
         static_tf_body_pelvis,
+        rviz_node,
         fast_lio_launch,
-        height_mapping_node,
-        rviz_node
+        height_spoof_node
     ])
